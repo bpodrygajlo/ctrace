@@ -143,8 +143,8 @@ include(cmake/CPM.cmake)
 
 CPMAddPackage(
     NAME ctrace
-    GITHUB_REPOSITORY <your-org>/ctrace
-    GIT_TAG v1.0.0 # or SOURCE_DIR /path/to/ctrace
+    GITHUB_REPOSITORY bpodrygajlo/ctrace
+    GIT_TAG main # or SOURCE_DIR /path/to/ctrace
 )
 
 add_executable(my_service main.c)
