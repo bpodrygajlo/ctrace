@@ -58,21 +58,31 @@ if(NOT Clang_FOUND)
     find_package(Clang REQUIRED CONFIG)
 endif()
 
+find_package(nlohmann_json QUIET)
+
 # Header-only interface target
 add_library(ctrace_headers INTERFACE)
 target_include_directories(ctrace_headers INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+add_library(ctrace::headers ALIAS ctrace_headers)
+add_library(ctrace::ctrace_headers ALIAS ctrace_headers)
 
 # Tool 1: ctrace-scan (AST Extractor)
 add_executable(ctrace-scan tools/ctrace-scan/main.cpp)
 target_include_directories(ctrace-scan PRIVATE ${CLANG_INCLUDE_DIRS})
 target_link_libraries(ctrace-scan PRIVATE clang-cpp LLVM)
+if(TARGET nlohmann_json::nlohmann_json)
+    target_link_libraries(ctrace-scan PRIVATE nlohmann_json::nlohmann_json)
+endif()
 add_executable(ctrace::ctrace-scan ALIAS ctrace-scan)
 
 # Tool 2: ctrace-gen (Schema Merge & Code Generator)
 add_executable(ctrace-gen tools/ctrace-gen/main.cpp)
+if(TARGET nlohmann_json::nlohmann_json)
+    target_link_libraries(ctrace-gen PRIVATE nlohmann_json::nlohmann_json)
+endif()
 add_executable(ctrace::ctrace-gen ALIAS ctrace-gen)
 
 # Runtime libraries
@@ -171,6 +181,7 @@ install(FILES
 
 # Export for build tree usage
 export(EXPORT ctraceTargets
+    NAMESPACE ctrace::
     FILE "${CMAKE_CURRENT_BINARY_DIR}/ctraceTargets.cmake"
 )
 

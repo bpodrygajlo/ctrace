@@ -23,21 +23,149 @@ TYPE_FORMATS = {
     "bool": ("B", 1),
 }
 
-def flatten_schema_fields(fields, prefix=""):
+ENUM_FORMATS = {
+    (1, True): ("b", 1),
+    (1, False): ("B", 1),
+    (2, True): ("<h", 2),
+    (2, False): ("<H", 2),
+    (4, True): ("<i", 4),
+    (4, False): ("<I", 4),
+    (8, True): ("<q", 8),
+    (8, False): ("<Q", 8),
+}
+
+def _flatten_fields_raw(fields, prefix=""):
     flat = []
     for f in fields:
-        name = prefix + f["name"]
+        name = f["name"] if not prefix else f"{prefix}_{f['name']}"
         if f.get("type") == "struct":
             sub_fields = f.get("fields", [])
-            flat.extend(flatten_schema_fields(sub_fields, prefix=name + "_"))
+            flat.extend(_flatten_fields_raw(sub_fields, prefix=name))
         else:
             flat.append({
                 "name": name,
                 "type": f.get("type", "uint64"),
                 "size": f.get("size", 8),
+                "is_signed": f.get("is_signed", False),
                 "constants": f.get("constants", []),
+                "fields": f.get("fields", []),
             })
     return flat
+
+def flatten_schema_fields(fields):
+    raw = _flatten_fields_raw(fields, "")
+    used = set()
+    result = []
+    for ff in raw:
+        base = ff["name"]
+        unique = base
+        counter = 2
+        while unique in used:
+            unique = f"{base}_{counter}"
+            counter += 1
+        used.add(unique)
+        ff_copy = dict(ff)
+        ff_copy["name"] = unique
+        result.append(ff_copy)
+    return result
+
+def decode_field_value(stream_data, offset, total_len, fld):
+    """Decodes a single flat field at offset, returning (value, new_offset) or (None, None) on truncation."""
+    ftype = fld["type"]
+
+    if ftype == "string":
+        if offset + 4 > total_len:
+            return None, None
+        slen, = struct.unpack_from("<I", stream_data, offset)
+        offset += 4
+        if offset + slen > total_len:
+            return None, None
+        s_bytes = stream_data[offset:offset + slen]
+        offset += slen
+        return s_bytes.decode("utf-8", errors="replace"), offset
+
+    if ftype == "bytes":
+        if offset + 4 > total_len:
+            return None, None
+        blen, = struct.unpack_from("<I", stream_data, offset)
+        offset += 4
+        if offset + blen > total_len:
+            return None, None
+        b_data = stream_data[offset:offset + blen]
+        offset += blen
+        return b_data.hex(), offset
+
+    if ftype == "counted_array":
+        if offset + 4 > total_len:
+            return None, None
+        blen, = struct.unpack_from("<I", stream_data, offset)
+        offset += 4
+        if offset + blen > total_len:
+            return None, None
+        end_offset = offset + blen
+        sub_fields = fld.get("fields", [])
+        if not sub_fields:
+            b_data = stream_data[offset:end_offset]
+            return b_data.hex(), end_offset
+
+        elem_schema = sub_fields[0]
+        elem_type = elem_schema.get("type", "uint8")
+        items = []
+        sub_off = offset
+
+        if elem_type == "struct":
+            elem_flat = flatten_schema_fields(elem_schema.get("fields", []))
+            while sub_off < end_offset:
+                item_obj = {}
+                for sf in elem_flat:
+                    val, next_off = decode_field_value(stream_data, sub_off, end_offset, sf)
+                    if next_off is None:
+                        return None, None
+                    item_obj[sf["name"]] = val
+                    sub_off = next_off
+                items.append(item_obj)
+        else:
+            while sub_off < end_offset:
+                val, next_off = decode_field_value(stream_data, sub_off, end_offset, elem_schema)
+                if next_off is None:
+                    return None, None
+                items.append(val)
+                sub_off = next_off
+
+        return items, end_offset
+
+    if ftype in TYPE_FORMATS:
+        fmt, size = TYPE_FORMATS[ftype]
+        if offset + size > total_len:
+            return None, None
+        val, = struct.unpack_from(fmt, stream_data, offset)
+        offset += size
+        if ftype == "bool":
+            val = bool(val)
+        return val, offset
+
+    if ftype == "enum":
+        sz = fld.get("size", 4)
+        is_signed = fld.get("is_signed", True)
+        fmt, size = ENUM_FORMATS.get((sz, is_signed), ("<i", 4))
+        if offset + size > total_len:
+            return None, None
+        val, = struct.unpack_from(fmt, stream_data, offset)
+        offset += size
+        c_name = str(val)
+        for c in fld.get("constants", []):
+            if c.get("value") == val:
+                c_name = c.get("name", str(val))
+                break
+        return c_name, offset
+
+    sz = fld.get("size", 8)
+    fmt = "<I" if sz == 4 else ("<H" if sz == 2 else ("B" if sz == 1 else "<Q"))
+    if offset + sz > total_len:
+        return None, None
+    val, = struct.unpack_from(fmt, stream_data, offset)
+    offset += sz
+    return val, offset
 
 def decode_stream(stream_data, schema):
     events_by_id = {}
@@ -55,8 +183,7 @@ def decode_stream(stream_data, schema):
         offset += 10
 
         if ev_id not in events_by_id:
-            # Unknown event or end of stream
-            break
+            raise ValueError(f"Unknown event_id {ev_id} at stream byte offset {offset - 10}")
 
         ev_info = events_by_id[ev_id]
         record = {
@@ -66,59 +193,22 @@ def decode_stream(stream_data, schema):
             "fields": {}
         }
 
+        truncated = False
         for fld in ev_info["flat_fields"]:
             fname = fld["name"]
-            ftype = fld["type"]
+            val, next_offset = decode_field_value(stream_data, offset, total_len, fld)
+            if next_offset is None:
+                truncated = True
+                break
+            record["fields"][fname] = val
+            offset = next_offset
 
-            if ftype == "string":
-                if offset + 4 > total_len:
-                    break
-                slen, = struct.unpack_from("<I", stream_data, offset)
-                offset += 4
-                s_bytes = stream_data[offset:offset + slen]
-                offset += slen
-                record["fields"][fname] = s_bytes.decode("utf-8", errors="replace")
-            elif ftype == "bytes":
-                if offset + 4 > total_len:
-                    break
-                blen, = struct.unpack_from("<I", stream_data, offset)
-                offset += 4
-                b_data = stream_data[offset:offset + blen]
-                offset += blen
-                record["fields"][fname] = b_data.hex()
-            elif ftype in TYPE_FORMATS:
-                fmt, size = TYPE_FORMATS[ftype]
-                if offset + size > total_len:
-                    break
-                val, = struct.unpack_from(fmt, stream_data, offset)
-                offset += size
-                if ftype == "bool":
-                    val = bool(val)
-                record["fields"][fname] = val
-            elif ftype == "enum":
-                # Enums stored as int32 or uint32
-                if offset + 4 > total_len:
-                    break
-                val, = struct.unpack_from("<i", stream_data, offset)
-                offset += 4
-                # Lookup constant name if available
-                c_name = str(val)
-                for c in fld.get("constants", []):
-                    if c.get("value") == val:
-                        c_name = c.get("name", str(val))
-                        break
-                record["fields"][fname] = c_name
-            else:
-                sz = fld.get("size", 8)
-                if sz == 4:
-                    val, = struct.unpack_from("<I", stream_data, offset)
-                else:
-                    val, = struct.unpack_from("<Q", stream_data, offset)
-                offset += sz
-                record["fields"][fname] = val
+        if truncated:
+            raise ValueError(f"Truncated event '{ev_info['name']}' in binary stream")
 
         decoded.append(record)
 
+    decoded.sort(key=lambda r: r["timestamp_ns"])
     return decoded
 
 def decompress_zstd_chunks(data):
@@ -127,7 +217,15 @@ def decompress_zstd_chunks(data):
     offset = 0
     total = len(data)
 
-    while offset + 4 < total:
+    dctx = None
+    try:
+        import zstandard as zstd
+        dctx = zstd.ZstdDecompressor()
+    except ImportError:
+        pass
+
+    concat_frames = bytearray()
+    while offset + 4 <= total:
         comp_len, = struct.unpack_from("<I", data, offset)
         offset += 4
         if comp_len == 0 or offset + comp_len > total:
@@ -135,14 +233,21 @@ def decompress_zstd_chunks(data):
         chunk = data[offset:offset + comp_len]
         offset += comp_len
 
-        # Decompress using zstandard python module or cli
-        try:
-            import zstandard as zstd
-            dctx = zstd.ZstdDecompressor()
+        if dctx is not None:
             decompressed.extend(dctx.decompress(chunk))
-        except ImportError:
-            proc = subprocess.run(["zstd", "-d", "-c"], input=chunk, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            decompressed.extend(proc.stdout)
+        else:
+            concat_frames.extend(chunk)
+
+    if dctx is None and len(concat_frames) > 0:
+        # Zstandard specification guarantees concatenated frames decompress in a single pass
+        proc = subprocess.run(
+            ["zstd", "-d", "-c"],
+            input=bytes(concat_frames),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        decompressed.extend(proc.stdout)
 
     return bytes(decompressed)
 

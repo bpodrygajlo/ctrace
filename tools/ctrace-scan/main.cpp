@@ -37,7 +37,7 @@ struct EnumConstant {
 
 struct FieldInfo {
     std::string name;
-    std::string type_kind; // int8..int64, uint8..uint64, float, double, bool, string, bytes, enum, struct
+    std::string type_kind; // int8..int64, uint8..uint64, float, double, bool, string, bytes, enum, struct, counted_array
     std::string c_type;
     uint64_t size = 0;
     bool is_signed = false;
@@ -50,7 +50,7 @@ struct FieldInfo {
     std::string enum_name;
     std::vector<EnumConstant> enum_constants;
 
-    // For structs
+    // For structs / counted_array
     std::string struct_name;
     std::vector<FieldInfo> struct_fields;
 };
@@ -63,7 +63,7 @@ struct EventInfo {
     std::vector<FieldInfo> fields;
 };
 
-std::map<std::tuple<std::string, std::string, unsigned>, EventInfo> g_collected_events;
+std::map<std::tuple<std::string, std::string, unsigned, unsigned>, EventInfo> g_collected_events;
 
 std::string getCountedByField(const FieldDecl *FD) {
     if (!FD) return "";
@@ -125,14 +125,22 @@ bool isCtraceBytesType(QualType QT, ASTContext &Ctx) {
     return false;
 }
 
-bool isStringType(QualType QT) {
+// Returns true ONLY for plain 'char' (Char_S / Char_U), NOT 'signed char' (int8_t) or 'unsigned char' (uint8_t)
+bool isPlainCharType(QualType QT) {
+    QualType canon = QT.getCanonicalType();
+    if (const auto *BT = canon->getAs<BuiltinType>()) {
+        return BT->getKind() == BuiltinType::Char_S || BT->getKind() == BuiltinType::Char_U;
+    }
+    return false;
+}
+
+bool isStringType(QualType QT, ASTContext &Ctx) {
     if (QT->isPointerType()) {
         QualType p = QT->getPointeeType();
-        if (p->isCharType()) return true;
+        if (isPlainCharType(p)) return true;
     }
-    if (QT->isArrayType()) {
-        const auto *AT = dyn_cast<ArrayType>(QT.getTypePtr());
-        if (AT && AT->getElementType()->isCharType()) return true;
+    if (const ArrayType *AT = Ctx.getAsArrayType(QT)) {
+        if (isPlainCharType(AT->getElementType())) return true;
     }
     return false;
 }
@@ -151,11 +159,17 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
         return f;
     }
 
-    // 2. Check string (char*, const char*, char[N])
-    if (isStringType(qualType)) {
+    // 2. Check string (char*, const char*, char[N], typedef char[N])
+    if (isStringType(qualType, Ctx)) {
         f.type_kind = "string";
         f.c_type = "const char *";
-        f.size = sizeof(void *);
+        if (const auto *CAT = Ctx.getAsConstantArrayType(qualType)) {
+            f.is_pointer = false;
+            f.size = CAT->getSize().getZExtValue();
+        } else {
+            f.is_pointer = true;
+            f.size = Ctx.getTypeSize(Ctx.VoidPtrTy) / 8;
+        }
         return f;
     }
 
@@ -185,9 +199,13 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                 f.enum_name = TT->getDecl()->getNameAsString();
             }
         }
-        f.c_type = f.enum_name.empty() ? ED->getIntegerType().getAsString() : (ED->getNameAsString().empty() ? f.enum_name : "enum " + f.enum_name);
+        QualType intTy = ED->getIntegerType();
+        if (intTy.isNull()) {
+            intTy = Ctx.IntTy;
+        }
+        f.c_type = f.enum_name.empty() ? intTy.getAsString() : (ED->getNameAsString().empty() ? f.enum_name : "enum " + f.enum_name);
         f.size = Ctx.getTypeSize(canon) / 8;
-        f.is_signed = ED->getIntegerType()->isSignedIntegerType();
+        f.is_signed = intTy->isSignedIntegerType();
 
         for (auto it = ED->enumerator_begin(); it != ED->enumerator_end(); ++it) {
             EnumConstant ec;
@@ -198,8 +216,8 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
         return f;
     }
 
-    // 5. Check struct
-    if ((canon->isStructureType() || canon->isRecordType()) && depth < 4) {
+    // 5. Check struct (exclude union via isStructureType())
+    if (canon->isStructureType() && depth < 4) {
         f.type_kind = "struct";
         const auto *RT = canon->getAs<RecordType>();
         const RecordDecl *RD = RT->getDecl()->getDefinition();
@@ -220,6 +238,9 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
         f.size = Ctx.getTypeSize(canon) / 8;
 
         for (const FieldDecl *FD : RD->fields()) {
+            if (FD->isBitField() || FD->getNameAsString().empty()) {
+                continue;
+            }
             QualType ft = FD->getType();
             std::string countField = getCountedByField(FD);
             if (!countField.empty()) {
@@ -241,6 +262,7 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                     cf.type_kind = "counted_array";
                     cf.c_type = ft.getAsString();
                     cf.counted_by = countField;
+                    cf.is_pointer = ft->isPointerType();
                     cf.size = elem.size;
                     cf.struct_fields.push_back(elem);
                     f.struct_fields.push_back(cf);
@@ -248,19 +270,26 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                 }
             }
 
-            // Skip pointers inside struct (unless string)
-            if (ft->isPointerType() && !isStringType(ft)) {
+            // Skip raw pointers inside struct (unless string)
+            if (ft->isPointerType() && !isStringType(ft, Ctx)) {
                 continue;
             }
             QualType ftCanon = ft.getCanonicalType();
-            // Skip flexible array members (incomplete arrays e.g. int payload[])
+            // Skip flexible array members without CTRACE_COUNTED_BY
             if (ftCanon->isIncompleteArrayType()) {
                 continue;
             }
-            if (ftCanon->isConstantArrayType()) {
-                const auto *CAT = Ctx.getAsConstantArrayType(ftCanon);
+            // Skip unions or structs beyond max recursion depth inside structs
+            if (ftCanon->isUnionType() || (ftCanon->isStructureType() && depth + 1 >= 4 && !isCtraceBytesType(ft, Ctx))) {
+                continue;
+            }
+            if (const auto *CAT = Ctx.getAsConstantArrayType(ft)) {
                 QualType elemType = CAT->getElementType();
-                if (!elemType->isCharType()) {
+                if (!isPlainCharType(elemType)) {
+                    // Skip multi-dimensional arrays inside structs
+                    if (elemType->isArrayType() || elemType->isUnionType()) {
+                        continue;
+                    }
                     uint64_t arrLen = CAT->getSize().getZExtValue();
                     for (uint64_t idx = 0; idx < arrLen; ++idx) {
                         std::string elemName = FD->getNameAsString() + "_" + std::to_string(idx);
@@ -302,29 +331,35 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
 
         if (bits <= 8) {
             f.type_kind = isSigned ? "int8" : "uint8";
+            f.c_type = isSigned ? "int8_t" : "uint8_t";
         } else if (bits <= 16) {
             f.type_kind = isSigned ? "int16" : "uint16";
+            f.c_type = isSigned ? "int16_t" : "uint16_t";
         } else if (bits <= 32) {
             f.type_kind = isSigned ? "int32" : "uint32";
+            f.c_type = isSigned ? "int32_t" : "uint32_t";
         } else {
             f.type_kind = isSigned ? "int64" : "uint64";
+            f.c_type = isSigned ? "int64_t" : "uint64_t";
         }
         return f;
     }
 
-    // 8. Fallback for pointers / other types
+    // 8. Pointers (struct pointers or raw data pointers like void*, uint8_t*, int*)
     if (canon->isPointerType()) {
         QualType pointee = canon->getPointeeType();
         QualType pCanon = pointee.getCanonicalType();
-        if ((pCanon->isStructureType() || pCanon->isRecordType()) && depth < 4) {
+        if (pCanon->isStructureType() && depth < 4) {
             FieldInfo s = resolveFieldType(pointee, name, Ctx, depth);
             s.is_pointer = true;
             s.c_type = qualType.getAsString();
             return s;
         }
-        f.type_kind = "uint64";
-        f.c_type = "uintptr_t";
-        f.size = 8;
+        uint64_t ptrBytes = Ctx.getTypeSize(canon) / 8;
+        f.type_kind = (ptrBytes == 4) ? "uint32" : "uint64";
+        f.c_type = "const void *";
+        f.is_pointer = true;
+        f.size = ptrBytes;
         return f;
     }
 
@@ -397,17 +432,21 @@ public:
 
             // Use the unpromoted expression's type to accurately detect enums, bools, etc.
             QualType typeToResolve = unpromoted->getType();
-            // But if unpromoted was an array (e.g. char[]), treat as string
-            if (isStringType(argExpr->getType())) {
+            if (isStringType(argExpr->getType(), *Ctx)) {
                 typeToResolve = argExpr->getType();
             }
 
             FieldInfo f = resolveFieldType(typeToResolve, uniqueName, *Ctx);
+            // Top-level string arguments always decay to const char * at call site
+            if (f.type_kind == "string") {
+                f.is_pointer = true;
+                f.size = Ctx->getTypeSize(Ctx->VoidPtrTy) / 8;
+            }
             ev.fields.push_back(f);
         }
 
-        // Deduplicate by (event_name, canonical_file, line)
-        auto key = std::make_tuple(ev.name, ev.file, ev.line);
+        // Deduplicate by (event_name, canonical_file, line, column)
+        auto key = std::make_tuple(ev.name, ev.file, ev.line, ev.column);
         g_collected_events[key] = ev;
 
         return true;
@@ -556,7 +595,10 @@ int main(int argc, const char **argv) {
         outPath = outPath.substr(1, outPath.size() - 2);
     }
     if (!outPath.empty()) {
-        std::filesystem::create_directories(std::filesystem::path(outPath).parent_path());
+        auto parent = std::filesystem::path(outPath).parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
     }
     if (outPath.empty()) {
         std::cout << root.dump(2) << std::endl;

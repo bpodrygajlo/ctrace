@@ -14,11 +14,13 @@ int main(void) {
     LogLevel lvl = LOG_WARN;
     bool active = true;
     const char *url = "https://ctf.trace.org/v1";
+    float latency_ms = 1.25f;
+    double throughput_gbps = 9.875;
 
     for (int i = 0; i < 30; ++i) {
         TRACE_EVENT(net_rx, socket_fd + i, len, payload);
     }
-    TRACE_EVENT(api_request, url, lvl, active);
+    TRACE_EVENT(api_request, url, lvl, active, latency_ms, throughput_gbps);
 
     ctrace_flush();
     ctrace_shutdown();

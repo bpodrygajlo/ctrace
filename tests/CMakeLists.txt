@@ -72,11 +72,17 @@ target_include_directories(test_counted_by PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_enable_ctrace(test_counted_by BACKEND stdout)
 add_test(NAME test_counted_by COMMAND test_counted_by)
 
-# Test 9: Background writer thread controls (name, RT guard, affinity, priority)
+# Test 9: Background writer thread controls (name, RT guard, affinity, priority, multi-wrap)
 add_executable(test_writer_thread test_writer_thread.c)
 target_include_directories(test_writer_thread PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_enable_ctrace(test_writer_thread BACKEND bin)
 add_test(NAME test_writer_thread COMMAND test_writer_thread)
+add_test(NAME test_writer_thread_decode
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/ctrace_decode.py
+            ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_writer_thread/trace_schema.json
+            test_writer.bin
+)
+set_tests_properties(test_writer_thread_decode PROPERTIES DEPENDS test_writer_thread)
 
 # Test 10: CPM package manager integration test
 set(CPM_TEST_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/cpm_build")

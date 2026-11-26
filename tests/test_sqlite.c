@@ -55,6 +55,16 @@ int main(void) {
     fclose(f);
     assert(size > 0);
 
+    // Test re-initialization after shutdown (verifying statement finalization & reset)
+    ctrace_init(":memory:");
+    TRACE_EVENT(net_rx, socket_fd, len, payload);
+    ctrace_flush();
+    g_query_row_count = 0;
+    rc = ctrace_sql_exec("SELECT COUNT(*) FROM ctrace_net_rx;", count_cb, NULL);
+    assert(rc == 0);
+    assert(g_query_row_count == 1);
+    ctrace_shutdown();
+
     printf("test_sqlite passed successfully!\n");
     return 0;
 }

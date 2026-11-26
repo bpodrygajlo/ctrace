@@ -1,6 +1,6 @@
 # ctrace.cmake - Public CMake integration API for ctrace
 
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Enable compile commands" FORCE)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Enable compile commands")
 
 if(NOT DEFINED CTRACE_BACKEND)
     set(CTRACE_BACKEND "stdout" CACHE STRING "Trace backend: stdout | bin | bin-zstd | sqlite | ctf")
@@ -71,7 +71,9 @@ function(target_enable_ctrace TARGET_NAME)
         if(SRC MATCHES "\\.c$")
             get_filename_component(SRC_ABS "${SRC}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
             get_filename_component(SRC_NAME "${SRC}" NAME)
-            set(SIDECAR "${GEN_DIR}/${SRC_NAME}.trace.json")
+            string(MD5 SRC_HASH "${SRC_ABS}")
+            string(SUBSTRING "${SRC_HASH}" 0 8 SRC_HASH_SHORT)
+            set(SIDECAR "${GEN_DIR}/${SRC_NAME}_${SRC_HASH_SHORT}.trace.json")
 
             add_custom_command(
                 OUTPUT "${SIDECAR}"

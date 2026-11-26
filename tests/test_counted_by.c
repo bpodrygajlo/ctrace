@@ -4,11 +4,7 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include "ctrace/ctrace_defs.h"
-
-#if defined(__GNUC__)
-#pragma GCC diagnostic ignored "-Wattributes"
-#endif
+#include "ctrace/trace.h"
 
 // Layer 2: Sub-item with dynamic payload
 typedef struct {
@@ -30,8 +26,6 @@ typedef struct {
     uint16_t num_items;
     int items[] CTRACE_COUNTED_BY(num_items);
 } WireFrame;
-
-#include "ctrace/trace.h"
 
 int main(void) {
     ctrace_init("test_counted_by.log");

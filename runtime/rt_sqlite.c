@@ -15,20 +15,47 @@ static int g_batch_count = 0;
 static struct timespec g_last_commit_ts;
 
 typedef void (*ctrace_sqlite_init_fn)(sqlite3 *db);
+typedef void (*ctrace_sqlite_cleanup_fn)(void);
+
 static ctrace_sqlite_init_fn g_sqlite_init_fn = NULL;
+static ctrace_sqlite_cleanup_fn g_sqlite_cleanup_fn = NULL;
 
 void ctrace_sqlite_register_init(ctrace_sqlite_init_fn fn) {
+    pthread_mutex_lock(&g_sqlite_mutex);
     g_sqlite_init_fn = fn;
     if (g_db && fn) {
-        pthread_mutex_lock(&g_sqlite_mutex);
         fn(g_db);
-        pthread_mutex_unlock(&g_sqlite_mutex);
     }
+    pthread_mutex_unlock(&g_sqlite_mutex);
 }
 
-// Weak symbol in case user code defines it directly
+void ctrace_sqlite_register_cleanup(ctrace_sqlite_cleanup_fn fn) {
+    pthread_mutex_lock(&g_sqlite_mutex);
+    g_sqlite_cleanup_fn = fn;
+    pthread_mutex_unlock(&g_sqlite_mutex);
+}
+
 __attribute__((weak)) void __ctrace_sqlite_init_events(sqlite3 *db) {
     (void)db;
+}
+
+__attribute__((weak)) void __ctrace_sqlite_finalize_events(void) {
+}
+
+static void close_sqlite_db_locked(void) {
+    if (!g_db) return;
+
+    if (g_in_transaction) {
+        sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL);
+        g_in_transaction = 0;
+    }
+    if (g_sqlite_cleanup_fn) {
+        g_sqlite_cleanup_fn();
+    } else if (__ctrace_sqlite_finalize_events) {
+        __ctrace_sqlite_finalize_events();
+    }
+    sqlite3_close_v2(g_db);
+    g_db = NULL;
 }
 
 void ctrace_sqlite_lock(void) {
@@ -62,14 +89,7 @@ void ctrace_sqlite_step_done(void) {
 void ctrace_init(const char *target_uri) {
     pthread_mutex_lock(&g_sqlite_mutex);
 
-    if (g_db) {
-        if (g_in_transaction) {
-            sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL);
-            g_in_transaction = 0;
-        }
-        sqlite3_close(g_db);
-        g_db = NULL;
-    }
+    close_sqlite_db_locked();
 
     const char *db_path = target_uri;
     if (!db_path || strcmp(db_path, "") == 0) {
@@ -81,7 +101,11 @@ void ctrace_init(const char *target_uri) {
                              NULL);
     if (rc != SQLITE_OK || !g_db) {
         fprintf(stderr, "[ctrace] Failed to open SQLite database '%s': %s\n",
-                db_path, sqlite3_errmsg(g_db));
+                db_path, g_db ? sqlite3_errmsg(g_db) : "out of memory");
+        if (g_db) {
+            sqlite3_close_v2(g_db);
+            g_db = NULL;
+        }
         pthread_mutex_unlock(&g_sqlite_mutex);
         return;
     }
@@ -118,14 +142,7 @@ void ctrace_flush(void) {
 
 void ctrace_shutdown(void) {
     pthread_mutex_lock(&g_sqlite_mutex);
-    if (g_db) {
-        if (g_in_transaction) {
-            sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL);
-            g_in_transaction = 0;
-        }
-        sqlite3_close(g_db);
-        g_db = NULL;
-    }
+    close_sqlite_db_locked();
     pthread_mutex_unlock(&g_sqlite_mutex);
 }
 
@@ -166,17 +183,36 @@ int ctrace_sql_snapshot(const char *dest_path) {
         g_in_transaction = 0;
     }
 
-    // SQLite VACUUM INTO fails if the file already exists; unlink first if present
-    unlink(dest_path);
+    // Vacuum into a temporary path first so an existing snapshot is never lost on error
+    size_t dlen = strlen(dest_path);
+    char *tmp_path = (char *)malloc(dlen + 16);
+    if (!tmp_path) {
+        sqlite3_exec(g_db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+        g_in_transaction = 1;
+        pthread_mutex_unlock(&g_sqlite_mutex);
+        return SQLITE_NOMEM;
+    }
+    snprintf(tmp_path, dlen + 16, "%s.tmp.%d", dest_path, (int)getpid());
+    unlink(tmp_path);
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(g_db, "VACUUM INTO ?;", -1, &stmt, NULL);
     int step_rc = SQLITE_ERROR;
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, dest_path, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 1, tmp_path, -1, SQLITE_STATIC);
         step_rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
     }
+
+    if (step_rc == SQLITE_DONE) {
+        if (rename(tmp_path, dest_path) != 0) {
+            unlink(tmp_path);
+            step_rc = SQLITE_IOERR;
+        }
+    } else {
+        unlink(tmp_path);
+    }
+    free(tmp_path);
 
     // Resume batching transaction
     sqlite3_exec(g_db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
