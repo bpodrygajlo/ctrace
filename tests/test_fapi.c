@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
+#include <pthread.h>
 
 typedef struct {
     uint16_t cce_index;
@@ -58,6 +59,31 @@ typedef struct {
     uint8_t *payload;
 } fapi_rx_data_t;
 CTRACE_BIND_COUNT(fapi_rx_data_t, payload, payload_len);
+
+/* Bug 5: union-typed field with no binding (e.g. pthread_mutex_t) */
+typedef struct {
+    int n;
+    pthread_mutex_t m;
+} fapi_with_mutex_t;
+
+/* Bug 6: union variant holding a count-bound array */
+typedef struct {
+    uint16_t rnti;
+    uint8_t n_cand;
+    uint16_t cce[64];
+    uint8_t opts[2];
+} fapi_dci_variant_t;
+typedef struct { int ta_val; } fapi_ta_variant_t;
+typedef struct {
+    uint8_t type;
+    union {
+        fapi_dci_variant_t dci;
+        fapi_ta_variant_t ta;
+    };
+} fapi_dyn_pdu_t;
+CTRACE_BIND_COUNT(fapi_dci_variant_t, cce, n_cand);
+CTRACE_BIND_UNION(fapi_dyn_pdu_t, type, 1, dci);
+CTRACE_BIND_UNION(fapi_dyn_pdu_t, type, 8, ta);
 
 // Out-of-line bindings (without modifying 3rd-party vendor headers)
 CTRACE_BIND_COUNT(fapi_dl_tti_req_t, cce_list, num_cce);
@@ -136,6 +162,30 @@ int main(void) {
     rx_data.payload = raw_payload;
 
     TRACE_EVENT(fapi_rx_event, rx_data);
+
+    // Test unbound union field (pthread_mutex_t)
+    fapi_with_mutex_t wm;
+    memset(&wm, 0, sizeof(wm));
+    wm.n = 42;
+    TRACE_EVENT(fapi_raw_event, wm);
+
+    // Test union variant holding a count-bound array
+    fapi_dyn_pdu_t dyn1;
+    memset(&dyn1, 0, sizeof(dyn1));
+    dyn1.type = 1;
+    dyn1.dci.rnti = 0x1234;
+    dyn1.dci.n_cand = 2;
+    dyn1.dci.cce[0] = 5;
+    dyn1.dci.cce[1] = 9;
+    dyn1.dci.opts[0] = 7;
+    dyn1.dci.opts[1] = 8;
+    TRACE_EVENT(fapi_dyn_pdu_event, dyn1);
+
+    fapi_dyn_pdu_t dyn2;
+    memset(&dyn2, 0, sizeof(dyn2));
+    dyn2.type = 8;
+    dyn2.ta.ta_val = 31;
+    TRACE_EVENT(fapi_dyn_pdu_event, dyn2);
 
     ctrace_flush();
     ctrace_shutdown();

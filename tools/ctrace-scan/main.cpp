@@ -330,7 +330,7 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                     uf.name = uName;
                     uf.is_anonymous = isAnon;
                     uf.first_member_name = firstMember;
-                    uf.type_kind = "bytes";
+                    uf.type_kind = "union";
                     uf.c_type = ft.getAsString();
                     uf.size = unionSize;
                     f.struct_fields.push_back(uf);
@@ -488,11 +488,24 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
             s.c_type = qualType.getAsString();
             return s;
         }
+        if (pCanon->isUnionType() && depth < 4) {
+            FieldInfo s = resolveFieldType(pointee, name, Ctx, depth);
+            s.is_pointer = true;
+            s.c_type = qualType.getAsString();
+            return s;
+        }
         uint64_t ptrBytes = Ctx.getTypeSize(canon) / 8;
         f.type_kind = (ptrBytes == 4) ? "uint32" : "uint64";
         f.c_type = "const void *";
         f.is_pointer = true;
         f.size = ptrBytes;
+        return f;
+    }
+
+    if (canon->isUnionType()) {
+        f.type_kind = "union";
+        f.c_type = qualType.getAsString();
+        f.size = Ctx.getTypeSize(canon) / 8;
         return f;
     }
 

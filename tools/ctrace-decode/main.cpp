@@ -508,10 +508,13 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
             }
         }
         case FieldType::Union: {
-            size_t sz = fld.size;
-            if (total_len - offset < sz) return false;
+            if (total_len - offset < 4) return false;
+            uint32_t u_len = read_unaligned<uint32_t>(stream + offset);
+            offset += 4;
+            if (total_len - offset < u_len) return false;
             const uint8_t *u_data = stream + offset;
-            offset += sz;
+            offset += u_len;
+            size_t sz = u_len;
             std::string tag_field = !fld.tag_field.empty() ? fld.tag_field : fld.counted_by;
             int64_t tag_val = -1;
             bool found_tag = false;
@@ -541,6 +544,8 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                 out.write_str(matched_case->name);
                 out.write_str("': ");
                 size_t u_off = 0;
+                std::vector<std::pair<std::string, int64_t>> var_tags;
+                if (current_tags) var_tags = *current_tags;
                 if (matched_case->type == FieldType::Struct) {
                     out.write_char('{');
                     for (size_t j = 0; j < matched_case->sub_fields.size(); ++j) {
@@ -548,19 +553,21 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                         out.write_char('\'');
                         out.write_str(matched_case->sub_fields[j].name);
                         out.write_str("': ");
-                        if (!decodeFieldValue(u_data, u_off, sz, matched_case->sub_fields[j], out, nullptr, nullptr, true)) {
+                        if (!decodeFieldValue(u_data, u_off, sz, matched_case->sub_fields[j], out, &var_tags, &var_tags, true)) {
                             return false;
                         }
                     }
                     out.write_char('}');
                 } else {
-                    if (!decodeFieldValue(u_data, u_off, sz, *matched_case, out, nullptr, nullptr, true)) {
+                    if (!decodeFieldValue(u_data, u_off, sz, *matched_case, out, &var_tags, &var_tags, true)) {
                         return false;
                     }
                 }
                 out.write_char('}');
             } else {
+                if (inside_dict) out.write_char('\'');
                 out.write_hex(u_data, sz);
+                if (inside_dict) out.write_char('\'');
             }
             return true;
         }

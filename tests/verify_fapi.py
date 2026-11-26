@@ -38,6 +38,19 @@ def main():
     assert u_fld["tag_field"] == "pdu_type", f"Expected tag_field 'pdu_type', got {u_fld['tag_field']}"
     assert "union_cases" in u_fld and len(u_fld["union_cases"]) == 3, f"Expected 3 union cases, got {u_fld.get('union_cases')}"
 
+    # Ensure unbound union in fapi_raw_event
+    raw_ev = next(e for e in schema["events"] if e["name"] == "fapi_raw_event")
+    wm_struct = raw_ev["fields"][0]
+    m_fld = next(f for f in wm_struct["fields"] if f["name"] == "m")
+    assert m_fld["type"] == "union", f"Expected union type for m, got {m_fld['type']}"
+    assert "union_cases" not in m_fld or len(m_fld["union_cases"]) == 0
+
+    # Ensure dynamic variant union in fapi_dyn_pdu_event
+    dyn_ev = next(e for e in schema["events"] if e["name"] == "fapi_dyn_pdu_event")
+    dyn_struct = dyn_ev["fields"][0]
+    dyn_u = next(f for f in dyn_struct["fields"] if f["type"] == "union")
+    assert len(dyn_u["union_cases"]) == 2
+
     # 2. Decode binary stream
     if decode_tool.endswith(".py"):
         cmd = [sys.executable, decode_tool, schema_path, bin_path]
@@ -73,6 +86,16 @@ def main():
     # Verify count-bound byte payload decoded as hex string (like TRACE_BYTES)
     assert "fapi_rx_event" in out
     assert "deadbeef" in out
+
+    # Verify unbound union (pthread_mutex_t)
+    assert "fapi_raw_event" in out
+    assert "wm_n=42" in out
+
+    # Verify union variant holding count-bound array
+    assert "fapi_dyn_pdu_event" in out
+    assert "'rnti': 4660" in out
+    assert "'cce': [5, 9]" in out
+    assert "'ta_val': 31" in out
 
     print("All FAPI union, fixed-array, and dynamic count binding assertions PASSED!")
 

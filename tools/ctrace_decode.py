@@ -119,21 +119,26 @@ def decode_field_value(stream_data, offset, total_len, fld, current_record=None)
         sub_fields = fld.get("fields", [])
         sub_flat = flatten_schema_fields(sub_fields)
         res_dict = {}
+        merged_rec = dict(current_record) if current_record else {}
         sub_off = offset
         for sf in sub_flat:
-            val, next_off = decode_field_value(stream_data, sub_off, total_len, sf, res_dict)
+            val, next_off = decode_field_value(stream_data, sub_off, total_len, sf, merged_rec)
             if next_off is None:
                 return None, None
             res_dict[sf["name"]] = val
+            merged_rec[sf["name"]] = val
             sub_off = next_off
         return res_dict, sub_off
 
     if ftype == "union":
-        sz = fld.get("size", 0)
-        if offset + sz > total_len:
+        if offset + 4 > total_len:
             return None, None
-        u_data = stream_data[offset:offset + sz]
-        offset += sz
+        u_len, = struct.unpack_from("<I", stream_data, offset)
+        offset += 4
+        if offset + u_len > total_len:
+            return None, None
+        u_data = stream_data[offset:offset + u_len]
+        offset += u_len
         tag_field = fld.get("tag_field") or fld.get("counted_by", "")
         cases = fld.get("union_cases", [])
         if current_record is not None:
@@ -147,7 +152,8 @@ def decode_field_value(stream_data, offset, total_len, fld, current_record=None)
                 for c in cases:
                     c_tag = c.get("array_index") if "array_index" in c else c.get("tag_val")
                     if c_tag == tag_val or str(c.get("tag_val_str")) == str(tag_val) or str(c.get("array_parent")) == str(tag_val):
-                        val, _ = decode_field_value(u_data, 0, sz, c)
+                        var_rec = dict(current_record) if current_record else {}
+                        val, _ = decode_field_value(u_data, 0, u_len, c, var_rec)
                         return {c["name"]: val}, offset
         return u_data.hex(), offset
 

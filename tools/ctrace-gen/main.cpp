@@ -383,10 +383,10 @@ std::string generateCtfTsdl(const std::map<std::string, Event> &events) {
         for (const auto &ff : flatList) {
             if (ff.type_kind == "string") {
                 m << "        string " << ff.flat_name << ";\n";
-            } else if (ff.type_kind == "bytes" || ff.type_kind == "counted_array") {
+            } else if (ff.type_kind == "bytes" || ff.type_kind == "counted_array" || ff.type_kind == "union") {
                 m << "        uint32_t " << ff.flat_name << "_len;\n";
                 m << "        uint8_t " << ff.flat_name << "[" << ff.flat_name << "_len];\n";
-            } else if (ff.type_kind == "fixed_array" || ff.type_kind == "union") {
+            } else if (ff.type_kind == "fixed_array") {
                 m << "        uint8_t " << ff.flat_name << "[" << ff.size << "];\n";
             } else if (ff.type_kind == "bool") {
                 m << "        uint8_t " << ff.flat_name << ";\n";
@@ -434,6 +434,57 @@ std::string stringLenExpr(const FlatField &ff) {
     return "(" + ff.accessor_expr + " ? (uint32_t)strlen(" + ff.accessor_expr + ") : 0U)";
 }
 
+// Accessor helpers for unions
+static std::string getVariantAccessor(const FlatField &ff, const std::string &memberName) {
+    if (ff.is_anonymous) {
+        if (!ff.first_member_name.empty()) {
+            size_t pos = ff.accessor_expr.rfind(ff.first_member_name);
+            if (pos != std::string::npos) {
+                return ff.accessor_expr.substr(0, pos) + memberName;
+            }
+        }
+        return ff.accessor_expr;
+    } else {
+        return ff.accessor_expr + "." + memberName;
+    }
+}
+
+static std::string getUnionRawPointer(const FlatField &ff) {
+    return "(const void *)(&(" + ff.accessor_expr + "))";
+}
+
+void emitCountedArraySizeCalc(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol);
+void emitCountedArraySerialize(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol);
+void emitUnionSizeCalc(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol);
+void emitUnionSerialize(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol);
+void emitFlatListSizeCalc(std::ostringstream &h, const std::vector<FlatField> &flatList, const std::string &lenVar, int depth, bool isCtf, const std::string &eol);
+void emitFlatListSerialize(std::ostringstream &h, const std::vector<FlatField> &flatList, int depth, bool isCtf, const std::string &eol);
+
+void emitFlatListSizeCalc(std::ostringstream &h, const std::vector<FlatField> &flatList, const std::string &lenVar, int depth, bool isCtf, const std::string &eol) {
+    for (const auto &sf : flatList) {
+        if (sf.type_kind == "string") {
+            std::string sl = stringLenExpr(sf);
+            h << "        " << lenVar << " += " << (isCtf ? (sl + " + 1U") : ("4U + " + sl)) << ";" << eol;
+        } else if (sf.type_kind == "bytes") {
+            h << "        " << lenVar << " += 4U + (((" << sf.accessor_expr << ").ptr && (" << sf.accessor_expr << ").len > 0) ? (uint32_t)(" << sf.accessor_expr << ").len : 0U);" << eol;
+        } else if (sf.type_kind == "counted_array") {
+            std::string subLenVar = "_sublen_" + sf.flat_name + "_" + std::to_string(depth + 1);
+            emitCountedArraySizeCalc(h, sf, subLenVar, depth + 1, isCtf, eol);
+            h << "        " << lenVar << " += 4U + " << subLenVar << ";" << eol;
+        } else if (sf.type_kind == "union") {
+            std::string subLenVar = "_ulen_" + sf.flat_name + "_" + std::to_string(depth + 1);
+            emitUnionSizeCalc(h, sf, subLenVar, depth + 1, isCtf, eol);
+            h << "        " << lenVar << " += 4U + " << subLenVar << ";" << eol;
+        } else if (isCtf && sf.type_kind == "enum") {
+            h << "        " << lenVar << " += 4U;" << eol;
+        } else if (sf.type_kind == "bool") {
+            h << "        " << lenVar << " += 1U;" << eol;
+        } else {
+            h << "        " << lenVar << " += " << sf.size << "U;" << eol;
+        }
+    }
+}
+
 // Recursive size calculation for counted_array (supports nested structs & nested counted_arrays)
 void emitCountedArraySizeCalc(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol) {
     std::string cntExpr = getCountExpr(ff.accessor_expr, ff.counted_by);
@@ -453,28 +504,53 @@ void emitCountedArraySizeCalc(std::ostringstream &h, const FlatField &ff, const 
 
         h << "    uint32_t " << lenVar << " = 0;" << eol;
         h << "    for (size_t " << idxVar << " = 0; " << idxVar << " < " << cntVar << "; ++" << idxVar << ") {" << eol;
-        for (const auto &sf : subFlat) {
-            if (sf.type_kind == "string") {
-                std::string sl = stringLenExpr(sf);
-                h << "        " << lenVar << " += " << (isCtf ? (sl + " + 1U") : ("4U + " + sl)) << ";" << eol;
-            } else if (sf.type_kind == "bytes") {
-                h << "        " << lenVar << " += 4U + (((" << sf.accessor_expr << ").ptr && (" << sf.accessor_expr << ").len > 0) ? (uint32_t)(" << sf.accessor_expr << ").len : 0U);" << eol;
-            } else if (sf.type_kind == "counted_array") {
-                std::string subLenVar = "_sublen_" + sf.flat_name + "_" + std::to_string(depth + 1);
-                emitCountedArraySizeCalc(h, sf, subLenVar, depth + 1, isCtf, eol);
-                h << "        " << lenVar << " += 4U + " << subLenVar << ";" << eol;
-            } else if (isCtf && sf.type_kind == "enum") {
-                h << "        " << lenVar << " += 4U;" << eol;
-            } else if (sf.type_kind == "bool") {
-                h << "        " << lenVar << " += 1U;" << eol;
-            } else {
-                h << "        " << lenVar << " += " << sf.size << "U;" << eol;
-            }
-        }
+        emitFlatListSizeCalc(h, subFlat, lenVar, depth, isCtf, eol);
         h << "    }" << eol;
     } else {
         uint64_t esz = ff.elem_size > 0 ? ff.elem_size : 1;
         h << "    uint32_t " << lenVar << " = (uint32_t)(" << cntVar << " * " << esz << "U);" << eol;
+    }
+}
+
+void emitFlatListSerialize(std::ostringstream &h, const std::vector<FlatField> &flatList, int depth, bool isCtf, const std::string &eol) {
+    for (const auto &sf : flatList) {
+        if (sf.type_kind == "string") {
+            std::string slVar = "_sl_" + sf.flat_name + "_" + std::to_string(depth);
+            std::string sl = stringLenExpr(sf);
+            h << "        uint32_t " << slVar << " = " << sl << ";" << eol;
+            if (isCtf) {
+                h << "        if (" << slVar << " > 0) { memcpy(_p, " << sf.accessor_expr << ", " << slVar << "); _p += " << slVar << "; }" << eol;
+                h << "        *_p++ = \x27\\0\x27;" << eol;
+            } else {
+                h << "        memcpy(_p, &" << slVar << ", 4); _p += 4;" << eol;
+                h << "        if (" << slVar << " > 0) { memcpy(_p, " << sf.accessor_expr << ", " << slVar << "); _p += " << slVar << "; }" << eol;
+            }
+        } else if (sf.type_kind == "bytes") {
+            std::string blVar = "_bl_" + sf.flat_name + "_" + std::to_string(depth);
+            h << "        uint32_t " << blVar << " = ((" << sf.accessor_expr << ").ptr && (" << sf.accessor_expr << ").len > 0) ? (uint32_t)(" << sf.accessor_expr << ").len : 0U;" << eol;
+            h << "        memcpy(_p, &" << blVar << ", 4); _p += 4;" << eol;
+            if (!isCtf) {
+                h << "        if (" << blVar << " > 0) { memcpy(_p, (" << sf.accessor_expr << ").ptr, " << blVar << "); _p += " << blVar << "; }" << eol;
+            }
+        } else if (sf.type_kind == "counted_array") {
+            std::string subLenVar = "_sublen_" + sf.flat_name + "_" + std::to_string(depth + 1);
+            emitCountedArraySizeCalc(h, sf, subLenVar, depth + 1, isCtf, eol);
+            emitCountedArraySerialize(h, sf, subLenVar, depth + 1, isCtf, eol);
+        } else if (sf.type_kind == "union") {
+            std::string subLenVar = "_ulen_" + sf.flat_name + "_" + std::to_string(depth + 1);
+            emitUnionSizeCalc(h, sf, subLenVar, depth + 1, isCtf, eol);
+            emitUnionSerialize(h, sf, subLenVar, depth + 1, isCtf, eol);
+        } else if (sf.type_kind == "bool") {
+            h << "        uint8_t _bv = (" << sf.accessor_expr << ") ? 1 : 0; memcpy(_p, &_bv, 1); _p += 1;" << eol;
+        } else if (isCtf && sf.type_kind == "enum") {
+            h << "        int32_t _ev = (int32_t)(" << sf.accessor_expr << "); memcpy(_p, &_ev, 4); _p += 4;" << eol;
+        } else if (sf.type_kind == "fixed_array") {
+            h << "        memcpy(_p, (const void *)(" << sf.accessor_expr << "), " << sf.size << "); _p += " << sf.size << ";" << eol;
+        } else if (sf.is_pointer) {
+            h << "        uint" << (sf.size * 8) << "_t _pv = (uint" << (sf.size * 8) << "_t)(uintptr_t)(" << sf.accessor_expr << "); memcpy(_p, &_pv, " << sf.size << "); _p += " << sf.size << ";" << eol;
+        } else {
+            h << "        { __typeof__(" << sf.accessor_expr << ") _tmp = (" << sf.accessor_expr << "); memcpy(_p, &_tmp, " << sf.size << "); _p += " << sf.size << "; }" << eol;
+        }
     }
 }
 
@@ -491,44 +567,89 @@ void emitCountedArraySerialize(std::ostringstream &h, const FlatField &ff, const
         flattenFieldInternal(elemStruct, ff.flat_name, elemAcc, subFlat);
 
         h << "    for (size_t " << idxVar << " = 0; " << idxVar << " < " << cntVar << "; ++" << idxVar << ") {" << eol;
-        for (const auto &sf : subFlat) {
-            if (sf.type_kind == "string") {
-                std::string slVar = "_sl_" + sf.flat_name + "_" + std::to_string(depth);
-                h << "        uint32_t " << slVar << " = " << stringLenExpr(sf) << ";" << eol;
-                if (isCtf) {
-                    h << "        if (" << slVar << " > 0) { memcpy(_p, " << sf.accessor_expr << ", " << slVar << "); _p += " << slVar << "; }" << eol;
-                    h << "        *_p++ = '\\0';" << eol;
-                } else {
-                    h << "        memcpy(_p, &" << slVar << ", 4); _p += 4;" << eol;
-                    h << "        if (" << slVar << " > 0) { memcpy(_p, " << sf.accessor_expr << ", " << slVar << "); _p += " << slVar << "; }" << eol;
-                }
-            } else if (sf.type_kind == "bytes") {
-                std::string blVar = "_bl_" + sf.flat_name + "_" + std::to_string(depth);
-                h << "        uint32_t " << blVar << " = ((" << sf.accessor_expr << ").ptr && (" << sf.accessor_expr << ").len > 0) ? (uint32_t)(" << sf.accessor_expr << ").len : 0U;" << eol;
-                h << "        memcpy(_p, &" << blVar << ", 4); _p += 4;" << eol;
-                h << "        if (" << blVar << " > 0) { memcpy(_p, (" << sf.accessor_expr << ").ptr, " << blVar << "); _p += " << blVar << "; }" << eol;
-            } else if (sf.type_kind == "counted_array") {
-                std::string subLenVar = "_sublen_" + sf.flat_name + "_" + std::to_string(depth + 1);
-                emitCountedArraySizeCalc(h, sf, subLenVar, depth + 1, isCtf, eol);
-                emitCountedArraySerialize(h, sf, subLenVar, depth + 1, isCtf, eol);
-            } else if (sf.type_kind == "bool") {
-                h << "        uint8_t _bv = (" << sf.accessor_expr << ") ? 1 : 0; memcpy(_p, &_bv, 1); _p += 1;" << eol;
-            } else if (isCtf && sf.type_kind == "enum") {
-                h << "        int32_t _ev = (int32_t)(" << sf.accessor_expr << "); memcpy(_p, &_ev, 4); _p += 4;" << eol;
-            } else if (sf.type_kind == "fixed_array") {
-                h << "        memcpy(_p, (const void *)(" << sf.accessor_expr << "), " << sf.size << "); _p += " << sf.size << ";" << eol;
-            } else if (sf.type_kind == "union") {
-                h << "        memcpy(_p, (const void *)(&(" << sf.accessor_expr << ")), " << sf.size << "); _p += " << sf.size << ";" << eol;
-            } else if (sf.is_pointer) {
-                h << "        uint" << (sf.size * 8) << "_t _pv = (uint" << (sf.size * 8) << "_t)(uintptr_t)(" << sf.accessor_expr << "); memcpy(_p, &_pv, " << sf.size << "); _p += " << sf.size << ";" << eol;
-            } else {
-                h << "        { __typeof__(" << sf.accessor_expr << ") _tmp = (" << sf.accessor_expr << "); memcpy(_p, &_tmp, " << sf.size << "); _p += " << sf.size << "; }" << eol;
-            }
-        }
+        emitFlatListSerialize(h, subFlat, depth, isCtf, eol);
         h << "    }" << eol;
     } else {
         h << "    if (" << lenVar << " > 0) { memcpy(_p, (const void *)(" << ff.accessor_expr << "), " << lenVar << "); _p += " << lenVar << "; }" << eol;
     }
+}
+
+void emitUnionSizeCalc(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol) {
+    h << "    uint32_t " << lenVar << " = 0;" << eol;
+    if (ff.struct_fields.empty() || ff.tag_field.empty()) {
+        h << "    " << lenVar << " = " << ff.size << "U;" << eol;
+        return;
+    }
+    std::string tagExpr = getCountExpr(ff.accessor_expr, ff.tag_field);
+
+    std::vector<std::string> memberNames;
+    std::map<std::string, std::vector<int64_t>> tagsByMember;
+    std::map<std::string, Field> fieldByMember;
+    for (const auto &c : ff.struct_fields) {
+        if (tagsByMember.find(c.name) == tagsByMember.end()) {
+            memberNames.push_back(c.name);
+            fieldByMember[c.name] = c;
+        }
+        tagsByMember[c.name].push_back(c.array_index);
+    }
+
+    h << "    switch ((int64_t)(" << tagExpr << ")) {" << eol;
+    for (const auto &mName : memberNames) {
+        for (auto t : tagsByMember[mName]) {
+            h << "        case " << t << ":" << eol;
+        }
+        h << "        {" << eol;
+        std::string varAcc = getVariantAccessor(ff, mName);
+        std::vector<FlatField> varFlat;
+        flattenFieldInternal(fieldByMember[mName], ff.flat_name + "_" + mName, varAcc, varFlat);
+        emitFlatListSizeCalc(h, varFlat, lenVar, depth + 1, isCtf, eol);
+        h << "            break;" << eol;
+        h << "        }" << eol;
+    }
+    h << "        default: {" << eol;
+    h << "            " << lenVar << " = " << ff.size << "U;" << eol;
+    h << "            break;" << eol;
+    h << "        }" << eol;
+    h << "    }" << eol;
+}
+
+void emitUnionSerialize(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol) {
+    h << "    memcpy(_p, &" << lenVar << ", 4); _p += 4;" << eol;
+    if (ff.struct_fields.empty() || ff.tag_field.empty()) {
+        h << "    if (" << lenVar << " > 0) { memcpy(_p, " << getUnionRawPointer(ff) << ", " << lenVar << "); _p += " << lenVar << "; }" << eol;
+        return;
+    }
+    std::string tagExpr = getCountExpr(ff.accessor_expr, ff.tag_field);
+
+    std::vector<std::string> memberNames;
+    std::map<std::string, std::vector<int64_t>> tagsByMember;
+    std::map<std::string, Field> fieldByMember;
+    for (const auto &c : ff.struct_fields) {
+        if (tagsByMember.find(c.name) == tagsByMember.end()) {
+            memberNames.push_back(c.name);
+            fieldByMember[c.name] = c;
+        }
+        tagsByMember[c.name].push_back(c.array_index);
+    }
+
+    h << "    switch ((int64_t)(" << tagExpr << ")) {" << eol;
+    for (const auto &mName : memberNames) {
+        for (auto t : tagsByMember[mName]) {
+            h << "        case " << t << ":" << eol;
+        }
+        h << "        {" << eol;
+        std::string varAcc = getVariantAccessor(ff, mName);
+        std::vector<FlatField> varFlat;
+        flattenFieldInternal(fieldByMember[mName], ff.flat_name + "_" + mName, varAcc, varFlat);
+        emitFlatListSerialize(h, varFlat, depth + 1, isCtf, eol);
+        h << "            break;" << eol;
+        h << "        }" << eol;
+    }
+    h << "        default: {" << eol;
+    h << "            if (" << lenVar << " > 0) { memcpy(_p, " << getUnionRawPointer(ff) << ", " << lenVar << "); _p += " << lenVar << "; }" << eol;
+    h << "            break;" << eol;
+    h << "        }" << eol;
+    h << "    }" << eol;
 }
 
 int main(int argc, char **argv) {
@@ -973,14 +1094,16 @@ int main(int argc, char **argv) {
                 h << "    uint32_t _len_" << ff.flat_name << " = ((" << ff.accessor_expr << ").ptr && (" << ff.accessor_expr << ").len > 0) ? (uint32_t)(" << ff.accessor_expr << ").len : 0U;" << eol;
             } else if (ff.type_kind == "counted_array") {
                 emitCountedArraySizeCalc(h, ff, "_len_" + ff.flat_name, 0, false, eol);
+            } else if (ff.type_kind == "union") {
+                emitUnionSizeCalc(h, ff, "_len_" + ff.flat_name, 0, false, eol);
             }
         }
 
         h << "    size_t _total_len = sizeof(uint16_t) + sizeof(uint64_t)";
         for (const auto &ff : flatList) {
-            if (ff.type_kind == "string" || ff.type_kind == "bytes" || ff.type_kind == "counted_array") {
+            if (ff.type_kind == "string" || ff.type_kind == "bytes" || ff.type_kind == "counted_array" || ff.type_kind == "union") {
                 h << " + sizeof(uint32_t) + _len_" << ff.flat_name;
-            } else if (ff.type_kind == "fixed_array" || ff.type_kind == "union") {
+            } else if (ff.type_kind == "fixed_array") {
                 h << " + " << ff.size;
             } else {
                 h << " + " << ff.size;
@@ -1003,10 +1126,10 @@ int main(int argc, char **argv) {
                 h << "    if (_len_" << ff.flat_name << " > 0) { memcpy(_p, (" << ff.accessor_expr << ").ptr, _len_" << ff.flat_name << "); _p += _len_" << ff.flat_name << "; }" << eol;
             } else if (ff.type_kind == "counted_array") {
                 emitCountedArraySerialize(h, ff, "_len_" + ff.flat_name, 0, false, eol);
+            } else if (ff.type_kind == "union") {
+                emitUnionSerialize(h, ff, "_len_" + ff.flat_name, 0, false, eol);
             } else if (ff.type_kind == "fixed_array") {
                 h << "    memcpy(_p, (const void *)(" << ff.accessor_expr << "), " << ff.size << "); _p += " << ff.size << ";" << eol;
-            } else if (ff.type_kind == "union") {
-                h << "    memcpy(_p, (const void *)(&(" << ff.accessor_expr << ")), " << ff.size << "); _p += " << ff.size << ";" << eol;
             } else if (ff.type_kind == "bool") {
                 h << "    uint8_t _val_" << ff.flat_name << " = (" << ff.accessor_expr << ") ? 1 : 0;" << eol;
                 h << "    memcpy(_p, &_val_" << ff.flat_name << ", 1); _p += 1;" << eol;
@@ -1040,6 +1163,8 @@ int main(int argc, char **argv) {
                 h << "    uint32_t _len_" << ff.flat_name << " = ((" << ff.accessor_expr << ").ptr && (" << ff.accessor_expr << ").len > 0) ? (uint32_t)(" << ff.accessor_expr << ").len : 0U;" << eol;
             } else if (ff.type_kind == "counted_array") {
                 emitCountedArraySizeCalc(h, ff, "_len_" + ff.flat_name, 0, true, eol);
+            } else if (ff.type_kind == "union") {
+                emitUnionSizeCalc(h, ff, "_len_" + ff.flat_name, 0, true, eol);
             }
         }
 
@@ -1047,9 +1172,9 @@ int main(int argc, char **argv) {
         for (const auto &ff : flatList) {
             if (ff.type_kind == "string") {
                 h << " + _len_" << ff.flat_name << " + 1";
-            } else if (ff.type_kind == "bytes" || ff.type_kind == "counted_array") {
+            } else if (ff.type_kind == "bytes" || ff.type_kind == "counted_array" || ff.type_kind == "union") {
                 h << " + sizeof(uint32_t) + _len_" << ff.flat_name;
-            } else if (ff.type_kind == "fixed_array" || ff.type_kind == "union") {
+            } else if (ff.type_kind == "fixed_array") {
                 h << " + " << ff.size;
             } else if (ff.type_kind == "enum") {
                 h << " + 4";
@@ -1082,10 +1207,10 @@ int main(int argc, char **argv) {
                 h << "    }" << eol;
             } else if (ff.type_kind == "counted_array") {
                 emitCountedArraySerialize(h, ff, "_len_" + ff.flat_name, 0, true, eol);
+            } else if (ff.type_kind == "union") {
+                emitUnionSerialize(h, ff, "_len_" + ff.flat_name, 0, true, eol);
             } else if (ff.type_kind == "fixed_array") {
                 h << "    memcpy(_p, (const void *)(" << ff.accessor_expr << "), " << ff.size << "); _p += " << ff.size << ";" << eol;
-            } else if (ff.type_kind == "union") {
-                h << "    memcpy(_p, (const void *)(&(" << ff.accessor_expr << ")), " << ff.size << "); _p += " << ff.size << ";" << eol;
             } else if (ff.type_kind == "bool") {
                 h << "    uint8_t _val_" << ff.flat_name << " = (" << ff.accessor_expr << ") ? 1 : 0;" << eol;
                 h << "    memcpy(_p, &_val_" << ff.flat_name << ", 1); _p += 1;" << eol;
