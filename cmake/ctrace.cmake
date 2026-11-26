@@ -32,6 +32,13 @@ function(target_enable_ctrace TARGET_NAME)
         set(ACTIVE_BACKEND "${CTRACE_BACKEND}")
     endif()
 
+    # Normalize aliases to canonical exported targets
+    if(ACTIVE_BACKEND STREQUAL "multi")
+        set(ACTIVE_BACKEND "runtime")
+    elseif(ACTIVE_BACKEND STREQUAL "bin_zstd")
+        set(ACTIVE_BACKEND "bin-zstd")
+    endif()
+
     # Determine tool targets (handling both in-tree and imported package targets)
     if(TARGET ctrace::ctrace-scan)
         set(CTRACE_SCAN_TARGET ctrace::ctrace-scan)

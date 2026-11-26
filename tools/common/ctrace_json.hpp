@@ -86,6 +86,11 @@ public:
         return obj_val_.find(key) != obj_val_.end();
     }
 
+    const json &value(const std::string &key, const json &def) const {
+        if (!contains(key)) return def;
+        return (*this)[key];
+    }
+
     std::string value(const std::string &key, const char *def) const {
         return value(key, std::string(def ? def : ""));
     }
@@ -125,7 +130,7 @@ public:
         return static_cast<unsigned long long>((*this)[key].as_uint64(def));
     }
 
-    operator std::string() const {
+    explicit operator std::string() const {
         return (kind_ == Kind::String) ? str_val_ : "";
     }
 

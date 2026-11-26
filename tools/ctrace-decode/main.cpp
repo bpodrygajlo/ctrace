@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdint>
+#include <cmath>
 #include <charconv>
 #include <cstdio>
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -19,9 +21,17 @@
 
 #if defined(CTRACE_HAVE_ZSTD)
 #include <zstd.h>
+#include <zstd_errors.h>
 #endif
 
 using json = ctrace::json;
+
+template <typename T>
+static inline T read_unaligned(const uint8_t *p) {
+    T v;
+    std::memcpy(&v, p, sizeof(T));
+    return v;
+}
 
 class FastOutput {
 public:
@@ -33,25 +43,36 @@ public:
         flush();
         delete[] buf_;
     }
+    FastOutput(const FastOutput&) = delete;
+    FastOutput& operator=(const FastOutput&) = delete;
+
     void flush() {
         if (pos_ > 0) {
             size_t total = 0;
             while (total < pos_) {
                 ssize_t w = ::write(fd_, buf_ + total, pos_ - total);
-                if (w <= 0) break;
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (w == 0) break;
                 total += (size_t)w;
             }
             pos_ = 0;
         }
     }
     void write_str(const char *s, size_t len) {
-        if (pos_ + len > cap_) {
+        if (len > cap_ - pos_) {
             flush();
             if (len > cap_) {
                 size_t total = 0;
                 while (total < len) {
                     ssize_t w = ::write(fd_, s + total, len - total);
-                    if (w <= 0) break;
+                    if (w < 0) {
+                        if (errno == EINTR) continue;
+                        break;
+                    }
+                    if (w == 0) break;
                     total += (size_t)w;
                 }
                 return;
@@ -78,8 +99,16 @@ public:
         pos_ = res.ptr - buf_;
     }
     void write_double(double v) {
+        if (std::isnan(v)) {
+            write_str("nan");
+            return;
+        }
+        if (std::isinf(v)) {
+            write_str(v < 0 ? "-inf" : "inf");
+            return;
+        }
         char tmp[64];
-        int n = std::snprintf(tmp, sizeof(tmp), "%g", v);
+        int n = std::snprintf(tmp, sizeof(tmp), "%.17g", v);
         if (n > 0) {
             bool hasDotOrExp = false;
             for (int i = 0; i < n; ++i) {
@@ -281,85 +310,83 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                              bool inside_dict) {
     switch (fld.type) {
         case FieldType::U8: {
-            if (offset + 1 > total_len) return false;
+            if (offset >= total_len) return false;
             uint8_t val = stream[offset++];
             out.write_u64((uint64_t)val);
             if (out_tags) out_tags->push_back({fld.name, (int64_t)val});
             return true;
         }
         case FieldType::I8: {
-            if (offset + 1 > total_len) return false;
-            int8_t val = *reinterpret_cast<const int8_t*>(stream + offset++);
+            if (offset >= total_len) return false;
+            int8_t val = static_cast<int8_t>(stream[offset++]);
             out.write_i64((int64_t)val);
             if (out_tags) out_tags->push_back({fld.name, (int64_t)val});
             return true;
         }
         case FieldType::U16: {
-            if (offset + 2 > total_len) return false;
-            uint16_t val = *reinterpret_cast<const uint16_t*>(stream + offset);
+            if (total_len - offset < 2) return false;
+            uint16_t val = read_unaligned<uint16_t>(stream + offset);
             offset += 2;
             out.write_u64((uint64_t)val);
             if (out_tags) out_tags->push_back({fld.name, (int64_t)val});
             return true;
         }
         case FieldType::I16: {
-            if (offset + 2 > total_len) return false;
-            int16_t val = *reinterpret_cast<const int16_t*>(stream + offset);
+            if (total_len - offset < 2) return false;
+            int16_t val = read_unaligned<int16_t>(stream + offset);
             offset += 2;
             out.write_i64((int64_t)val);
             if (out_tags) out_tags->push_back({fld.name, (int64_t)val});
             return true;
         }
         case FieldType::U32: {
-            if (offset + 4 > total_len) return false;
-            uint32_t val = *reinterpret_cast<const uint32_t*>(stream + offset);
+            if (total_len - offset < 4) return false;
+            uint32_t val = read_unaligned<uint32_t>(stream + offset);
             offset += 4;
             out.write_u64((uint64_t)val);
             if (out_tags) out_tags->push_back({fld.name, (int64_t)val});
             return true;
         }
         case FieldType::I32: {
-            if (offset + 4 > total_len) return false;
-            int32_t val = *reinterpret_cast<const int32_t*>(stream + offset);
+            if (total_len - offset < 4) return false;
+            int32_t val = read_unaligned<int32_t>(stream + offset);
             offset += 4;
             out.write_i64((int64_t)val);
             if (out_tags) out_tags->push_back({fld.name, (int64_t)val});
             return true;
         }
         case FieldType::U64: {
-            if (offset + 8 > total_len) return false;
-            uint64_t val = *reinterpret_cast<const uint64_t*>(stream + offset);
+            if (total_len - offset < 8) return false;
+            uint64_t val = read_unaligned<uint64_t>(stream + offset);
             offset += 8;
             out.write_u64(val);
             if (out_tags) out_tags->push_back({fld.name, (int64_t)val});
             return true;
         }
         case FieldType::I64: {
-            if (offset + 8 > total_len) return false;
-            int64_t val = *reinterpret_cast<const int64_t*>(stream + offset);
+            if (total_len - offset < 8) return false;
+            int64_t val = read_unaligned<int64_t>(stream + offset);
             offset += 8;
             out.write_i64(val);
             if (out_tags) out_tags->push_back({fld.name, val});
             return true;
         }
         case FieldType::Float: {
-            if (offset + 4 > total_len) return false;
-            float f;
-            std::memcpy(&f, stream + offset, 4);
+            if (total_len - offset < 4) return false;
+            float f = read_unaligned<float>(stream + offset);
             offset += 4;
             out.write_double((double)f);
             return true;
         }
         case FieldType::Double: {
-            if (offset + 8 > total_len) return false;
-            double d;
-            std::memcpy(&d, stream + offset, 8);
+            if (total_len - offset < 8) return false;
+            double d = read_unaligned<double>(stream + offset);
             offset += 8;
             out.write_double(d);
             return true;
         }
         case FieldType::Bool: {
-            if (offset + 1 > total_len) return false;
+            if (offset >= total_len) return false;
             uint8_t v = stream[offset++];
             out.write_str(v ? "True" : "False");
             if (out_tags) out_tags->push_back({fld.name, v ? 1 : 0});
@@ -367,12 +394,13 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
         }
         case FieldType::Enum: {
             size_t sz = fld.size > 0 ? fld.size : 4;
-            if (offset + sz > total_len) return false;
+            if (total_len - offset < sz) return false;
             int64_t val = 0;
-            if (sz == 1) val = fld.is_signed ? (int64_t)(*(const int8_t*)(stream + offset)) : (int64_t)(*(const uint8_t*)(stream + offset));
-            else if (sz == 2) val = fld.is_signed ? (int64_t)(*(const int16_t*)(stream + offset)) : (int64_t)(*(const uint16_t*)(stream + offset));
-            else if (sz == 4) val = fld.is_signed ? (int64_t)(*(const int32_t*)(stream + offset)) : (int64_t)(*(const uint32_t*)(stream + offset));
-            else val = *(const int64_t*)(stream + offset);
+            if (sz == 1) val = fld.is_signed ? (int64_t)(*reinterpret_cast<const int8_t*>(stream + offset)) : (int64_t)(stream[offset]);
+            else if (sz == 2) val = fld.is_signed ? (int64_t)read_unaligned<int16_t>(stream + offset) : (int64_t)read_unaligned<uint16_t>(stream + offset);
+            else if (sz == 4) val = fld.is_signed ? (int64_t)read_unaligned<int32_t>(stream + offset) : (int64_t)read_unaligned<uint32_t>(stream + offset);
+            else if (sz == 8) val = fld.is_signed ? read_unaligned<int64_t>(stream + offset) : (int64_t)read_unaligned<uint64_t>(stream + offset);
+            else return false;
             offset += sz;
             auto it = fld.enum_map.find(val);
             if (it != fld.enum_map.end()) {
@@ -384,10 +412,10 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
             return true;
         }
         case FieldType::String: {
-            if (offset + 4 > total_len) return false;
-            uint32_t slen = *reinterpret_cast<const uint32_t*>(stream + offset);
+            if (total_len - offset < 4) return false;
+            uint32_t slen = read_unaligned<uint32_t>(stream + offset);
             offset += 4;
-            if (offset + slen > total_len) return false;
+            if (total_len - offset < slen) return false;
             const char *str_data = reinterpret_cast<const char*>(stream + offset);
             offset += slen;
             if (inside_dict) out.write_char('\'');
@@ -396,10 +424,10 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
             return true;
         }
         case FieldType::Bytes: {
-            if (offset + 4 > total_len) return false;
-            uint32_t blen = *reinterpret_cast<const uint32_t*>(stream + offset);
+            if (total_len - offset < 4) return false;
+            uint32_t blen = read_unaligned<uint32_t>(stream + offset);
             offset += 4;
-            if (offset + blen > total_len) return false;
+            if (total_len - offset < blen) return false;
             const uint8_t *b_data = stream + offset;
             offset += blen;
             if (inside_dict) out.write_char('\'');
@@ -409,7 +437,7 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
         }
         case FieldType::FixedArray: {
             size_t sz = fld.size;
-            if (offset + sz > total_len) return false;
+            if (total_len - offset < sz) return false;
             const uint8_t *arr_bytes = stream + offset;
             offset += sz;
             out.write_char('[');
@@ -420,7 +448,9 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                 size_t elem_off = 0;
                 for (size_t i = 0; i < cnt; ++i) {
                     if (i > 0) out.write_str(", ");
-                    decodeFieldValue(arr_bytes, elem_off, sz, elem, out, nullptr, nullptr, false);
+                    if (!decodeFieldValue(arr_bytes, elem_off, sz, elem, out, nullptr, nullptr, false)) {
+                        return false;
+                    }
                 }
             } else {
                 for (size_t i = 0; i < sz; ++i) {
@@ -432,10 +462,10 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
             return true;
         }
         case FieldType::CountedArray: {
-            if (offset + 4 > total_len) return false;
-            uint32_t blen = *reinterpret_cast<const uint32_t*>(stream + offset);
+            if (total_len - offset < 4) return false;
+            uint32_t blen = read_unaligned<uint32_t>(stream + offset);
             offset += 4;
-            if (offset + blen > total_len) return false;
+            if (total_len - offset < blen) return false;
             size_t end_off = offset + blen;
             out.write_char('[');
             if (!fld.sub_fields.empty()) {
@@ -450,11 +480,15 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                             out.write_char('\'');
                             out.write_str(elem.sub_fields[j].name);
                             out.write_str("': ");
-                            decodeFieldValue(stream, offset, end_off, elem.sub_fields[j], out, nullptr, nullptr, true);
+                            if (!decodeFieldValue(stream, offset, end_off, elem.sub_fields[j], out, nullptr, nullptr, true)) {
+                                return false;
+                            }
                         }
                         out.write_char('}');
                     } else {
-                        decodeFieldValue(stream, offset, end_off, elem, out, nullptr, nullptr, false);
+                        if (!decodeFieldValue(stream, offset, end_off, elem, out, nullptr, nullptr, false)) {
+                            return false;
+                        }
                     }
                 }
             } else {
@@ -466,19 +500,19 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
         }
         case FieldType::Union: {
             size_t sz = fld.size;
-            if (offset + sz > total_len) return false;
+            if (total_len - offset < sz) return false;
             const uint8_t *u_data = stream + offset;
             offset += sz;
             std::string tag_field = !fld.tag_field.empty() ? fld.tag_field : fld.counted_by;
             int64_t tag_val = -1;
             bool found_tag = false;
             if (current_tags && !tag_field.empty()) {
-                for (const auto &p : *current_tags) {
-                    if (p.first == tag_field ||
-                        (p.first.size() > tag_field.size() &&
-                         p.first.compare(p.first.size() - tag_field.size(), tag_field.size(), tag_field) == 0 &&
-                         p.first[p.first.size() - tag_field.size() - 1] == '_')) {
-                        tag_val = p.second;
+                for (auto it = current_tags->rbegin(); it != current_tags->rend(); ++it) {
+                    if (it->first == tag_field ||
+                        (it->first.size() > tag_field.size() &&
+                         it->first.compare(it->first.size() - tag_field.size(), tag_field.size(), tag_field) == 0 &&
+                         it->first[it->first.size() - tag_field.size() - 1] == '_')) {
+                        tag_val = it->second;
                         found_tag = true;
                         break;
                     }
@@ -505,11 +539,15 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                         out.write_char('\'');
                         out.write_str(matched_case->sub_fields[j].name);
                         out.write_str("': ");
-                        decodeFieldValue(u_data, u_off, sz, matched_case->sub_fields[j], out, nullptr, nullptr, true);
+                        if (!decodeFieldValue(u_data, u_off, sz, matched_case->sub_fields[j], out, nullptr, nullptr, true)) {
+                            return false;
+                        }
                     }
                     out.write_char('}');
                 } else {
-                    decodeFieldValue(u_data, u_off, sz, *matched_case, out, nullptr, nullptr, true);
+                    if (!decodeFieldValue(u_data, u_off, sz, *matched_case, out, nullptr, nullptr, true)) {
+                        return false;
+                    }
                 }
                 out.write_char('}');
             } else {
@@ -524,7 +562,9 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                 out.write_char('\'');
                 out.write_str(fld.sub_fields[j].name);
                 out.write_str("': ");
-                decodeFieldValue(stream, offset, total_len, fld.sub_fields[j], out, current_tags, out_tags, true);
+                if (!decodeFieldValue(stream, offset, total_len, fld.sub_fields[j], out, current_tags, out_tags, true)) {
+                    return false;
+                }
             }
             out.write_char('}');
             return true;
@@ -538,23 +578,31 @@ static std::vector<uint8_t> decompressZstdFrames(const uint8_t *data, size_t tot
     std::vector<uint8_t> result;
 #if defined(CTRACE_HAVE_ZSTD)
     size_t offset = 0;
-    std::vector<uint8_t> chunk_buf;
     while (offset + 4 <= total) {
-        uint32_t comp_len = *reinterpret_cast<const uint32_t*>(data + offset);
+        uint32_t comp_len = read_unaligned<uint32_t>(data + offset);
         offset += 4;
-        if (comp_len == 0 || offset + comp_len > total) break;
+        if (comp_len == 0 || comp_len > total - offset) {
+            std::cerr << "ctrace-decode error: Corrupt ZSTD frame length at offset " << (offset - 4) << "\n";
+            return {};
+        }
         const void *src = data + offset;
         offset += comp_len;
 
         unsigned long long rsz = ZSTD_getFrameContentSize(src, comp_len);
-        if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN) {
-            rsz = comp_len * 4 + 65536;
+        if (rsz == ZSTD_CONTENTSIZE_ERROR) {
+            std::cerr << "ctrace-decode error: Invalid ZSTD frame content\n";
+            return {};
         }
-        chunk_buf.resize(rsz);
+        size_t initial_cap = (rsz == ZSTD_CONTENTSIZE_UNKNOWN) ? (comp_len * 4 + 65536) : (size_t)rsz;
+        std::vector<uint8_t> chunk_buf(initial_cap);
         size_t dsz = ZSTD_decompress(chunk_buf.data(), chunk_buf.size(), src, comp_len);
+        while (ZSTD_isError(dsz) && ZSTD_getErrorCode(dsz) == ZSTD_error_dstSize_tooSmall) {
+            chunk_buf.resize(chunk_buf.size() * 2);
+            dsz = ZSTD_decompress(chunk_buf.data(), chunk_buf.size(), src, comp_len);
+        }
         if (ZSTD_isError(dsz)) {
             std::cerr << "ctrace-decode error: ZSTD_decompress failed: " << ZSTD_getErrorName(dsz) << "\n";
-            break;
+            return {};
         }
         size_t old_sz = result.size();
         result.resize(old_sz + dsz);
@@ -649,13 +697,25 @@ int main(int argc, char **argv) {
 
     if (is_zst) {
         std::vector<uint8_t> raw_buf(file_len);
-        ssize_t r = ::read(fd, raw_buf.data(), file_len);
+        size_t total_read = 0;
+        while (total_read < file_len) {
+            ssize_t r = ::read(fd, raw_buf.data() + total_read, file_len - total_read);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (r == 0) break;
+            total_read += (size_t)r;
+        }
         close(fd);
-        if (r < 0 || (size_t)r != file_len) {
+        if (total_read != file_len) {
             std::cerr << "ctrace-decode error: Failed to read " << data_path << "\n";
             return 1;
         }
         decomp_buffer = decompressZstdFrames(raw_buf.data(), file_len);
+        if (decomp_buffer.empty() && file_len > 0) {
+            return 1;
+        }
         stream_ptr = decomp_buffer.data();
         file_len = decomp_buffer.size();
     } else {
@@ -665,8 +725,17 @@ int main(int argc, char **argv) {
             is_mmap = true;
         } else {
             decomp_buffer.resize(file_len);
-            ssize_t r = ::read(fd, decomp_buffer.data(), file_len);
-            if (r < 0 || (size_t)r != file_len) {
+            size_t total_read = 0;
+            while (total_read < file_len) {
+                ssize_t r = ::read(fd, decomp_buffer.data() + total_read, file_len - total_read);
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (r == 0) break;
+                total_read += (size_t)r;
+            }
+            if (total_read != file_len) {
                 close(fd);
                 std::cerr << "ctrace-decode error: Failed to read " << data_path << "\n";
                 return 1;
@@ -690,14 +759,16 @@ int main(int argc, char **argv) {
 
     size_t offset = 0;
     std::vector<std::pair<std::string, int64_t>> current_tags;
+    bool decode_ok = true;
 
     while (offset + 10 <= file_len) {
-        uint16_t ev_id = *reinterpret_cast<const uint16_t*>(stream_ptr + offset);
-        uint64_t ts_ns = *reinterpret_cast<const uint64_t*>(stream_ptr + offset + 2);
+        uint16_t ev_id = read_unaligned<uint16_t>(stream_ptr + offset);
+        uint64_t ts_ns = read_unaligned<uint64_t>(stream_ptr + offset + 2);
 
         auto it = decoders.find(ev_id);
         if (it == decoders.end()) {
             std::cerr << "ctrace-decode error: Unknown event ID " << ev_id << " at offset " << offset << "\n";
+            decode_ok = false;
             break;
         }
 
@@ -725,8 +796,14 @@ int main(int argc, char **argv) {
 
         if (truncated) {
             std::cerr << "ctrace-decode error: Truncated event '" << dec.name << "' at offset " << offset << "\n";
+            decode_ok = false;
             break;
         }
+    }
+
+    if (decode_ok && offset != file_len) {
+        std::cerr << "ctrace-decode error: Trailing unparsed bytes at offset " << offset << " (file size " << file_len << ")\n";
+        decode_ok = false;
     }
 
     fast_out.flush();
@@ -738,5 +815,5 @@ int main(int argc, char **argv) {
         munmap((void*)stream_ptr, file_len);
     }
 
-    return 0;
+    return decode_ok ? 0 : 1;
 }

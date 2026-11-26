@@ -8,7 +8,7 @@
 #include <stdatomic.h>
 
 static FILE *g_ctrace_out = NULL;
-#ifndef CTRACE_BACKEND_CUSTOM
+#if !defined(CTRACE_BACKEND_CUSTOM) || defined(CTRACE_MULTI_BACKEND)
 static int g_ctrace_owns_file = 0;
 #endif
 static pthread_mutex_t g_stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -113,7 +113,7 @@ void ctrace_stdout_release(FILE *f) {
     pthread_mutex_unlock(&g_stdout_mutex);
 }
 
-#ifndef CTRACE_BACKEND_CUSTOM
+#if !defined(CTRACE_BACKEND_CUSTOM) || defined(CTRACE_MULTI_BACKEND)
 // Default implementation of lifecycle for stdout backend
 #if defined(CTRACE_MULTI_BACKEND)
 void ctrace_init_stdout(const char *target_uri)

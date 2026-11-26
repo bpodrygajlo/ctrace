@@ -691,7 +691,7 @@ json fieldInfoToJson(const FieldInfo &f) {
         }
         j["struct_fields"] = subfields;
     } else if (f.type_kind == "fixed_array") {
-        j["array_len"] = f.array_index;
+        j["array_len"] = f.array_parent.empty() ? 0ULL : (unsigned long long)std::strtoull(f.array_parent.c_str(), nullptr, 10);
         json subfields = json::array();
         for (const auto &sub : f.struct_fields) {
             subfields.push_back(fieldInfoToJson(sub));

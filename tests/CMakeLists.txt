@@ -26,6 +26,13 @@ add_test(NAME test_bin_decode_cpp
 )
 set_tests_properties(test_bin_decode_cpp PROPERTIES DEPENDS test_bin)
 
+add_test(NAME test_decode_edge_cases
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_decode_edge_cases.py
+            $<TARGET_FILE:ctrace-decode>
+            ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_bin/trace_schema.json
+)
+set_tests_properties(test_decode_edge_cases PROPERTIES DEPENDS test_bin)
+
 # Test 3: bin-zstd backend (optional)
 if(TARGET ctrace_rt_bin-zstd)
     add_executable(test_zstd test_zstd.c)
