@@ -66,7 +66,7 @@ void parseField(const json &jf, Field &f) {
     f.first_member_name = jf.value("first_member_name", "");
 
     if (jf.contains("tag_val")) {
-        f.array_index = (int)jf.value("tag_val", (int64_t)f.array_index);
+        f.array_index = jf.value("tag_val", f.array_index);
     }
     if (jf.contains("tag_val_str")) {
         f.array_parent = jf.value("tag_val_str", f.array_parent);
