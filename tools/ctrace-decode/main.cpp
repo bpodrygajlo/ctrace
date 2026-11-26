@@ -291,16 +291,7 @@ struct EventDesc {
     uint16_t id = 0;
     std::string name;
     std::vector<FieldDesc> flat_fields;
-    bool is_all_fixed = true;
-    size_t fixed_size = 0;
 };
-
-static bool isScalarType(FieldType t) {
-    return t == FieldType::U8 || t == FieldType::I8 || t == FieldType::U16 || t == FieldType::I16 ||
-           t == FieldType::U32 || t == FieldType::I32 || t == FieldType::U64 || t == FieldType::I64 ||
-           t == FieldType::Float || t == FieldType::Double || t == FieldType::Bool || t == FieldType::Enum ||
-           t == FieldType::FixedArray;
-}
 
 static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total_len,
                              const FieldDesc &fld,
@@ -396,7 +387,7 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
             size_t sz = fld.size > 0 ? fld.size : 4;
             if (total_len - offset < sz) return false;
             int64_t val = 0;
-            if (sz == 1) val = fld.is_signed ? (int64_t)(*reinterpret_cast<const int8_t*>(stream + offset)) : (int64_t)(stream[offset]);
+            if (sz == 1) val = fld.is_signed ? (int64_t)static_cast<int8_t>(stream[offset]) : (int64_t)(stream[offset]);
             else if (sz == 2) val = fld.is_signed ? (int64_t)read_unaligned<int16_t>(stream + offset) : (int64_t)read_unaligned<uint16_t>(stream + offset);
             else if (sz == 4) val = fld.is_signed ? (int64_t)read_unaligned<int32_t>(stream + offset) : (int64_t)read_unaligned<uint32_t>(stream + offset);
             else if (sz == 8) val = fld.is_signed ? read_unaligned<int64_t>(stream + offset) : (int64_t)read_unaligned<uint64_t>(stream + offset);
@@ -652,17 +643,6 @@ int main(int argc, char **argv) {
             ed.id = ev.value("id", (uint16_t)0);
             ed.name = ev.value("name", "");
             ed.flat_fields = flattenSchemaFields(ev.value("fields", json::array()));
-
-            ed.is_all_fixed = true;
-            ed.fixed_size = 10; // id(2) + ts(8)
-            for (const auto &ff : ed.flat_fields) {
-                if (isScalarType(ff.type)) {
-                    ed.fixed_size += ff.size;
-                } else {
-                    ed.is_all_fixed = false;
-                    break;
-                }
-            }
             decoders[ed.id] = std::move(ed);
         }
     }

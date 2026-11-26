@@ -2,8 +2,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
-int g_ctrace_active_backend = 2; // Default: 2 = bin
+_Atomic int g_ctrace_active_backend = 0; // Default: 0 = off until ctrace_init()
 
 // Strong references to ensure linker pulls in backend implementations
 void ctrace_init_stdout(const char *target_uri);
@@ -20,7 +21,8 @@ void ctrace_shutdown_ctf(void);
 
 void ctrace_init(const char *target_uri) {
     // If a backend is already active, shut it down cleanly before switching
-    if (g_ctrace_active_backend != 0) {
+    int prev = atomic_load_explicit(&g_ctrace_active_backend, memory_order_acquire);
+    if (prev != 0) {
         ctrace_shutdown();
     }
 
@@ -40,7 +42,10 @@ void ctrace_init(const char *target_uri) {
         if (strcmp(env_b, "stdout") == 0 || strcmp(env_b, "stderr") == 0) backend = 1;
         else if (strcmp(env_b, "bin") == 0) backend = 2;
         else if (strcmp(env_b, "ctf") == 0) backend = 3;
-        else if (strcmp(env_b, "sqlite") == 0) {
+        else if (strcmp(env_b, "bin-zstd") == 0 || strcmp(env_b, "zstd") == 0) {
+            fprintf(stderr, "ctrace warning: bin-zstd backend is not enabled in multi-backend runtime mode; using 'bin'\n");
+            backend = 2;
+        } else if (strcmp(env_b, "sqlite") == 0) {
             fprintf(stderr, "ctrace warning: SQLite backend is not enabled in multi-backend runtime mode; using 'bin'\n");
             backend = 2;
         } else if (strcmp(env_b, "off") == 0 || strcmp(env_b, "none") == 0 || strcmp(env_b, "0") == 0) {
@@ -56,8 +61,6 @@ void ctrace_init(const char *target_uri) {
         }
     }
 
-    g_ctrace_active_backend = backend;
-
     if (backend == 1) {
         ctrace_init_stdout(out_path);
     } else if (backend == 2) {
@@ -65,18 +68,19 @@ void ctrace_init(const char *target_uri) {
     } else if (backend == 3) {
         ctrace_init_ctf(out_path);
     }
+
+    atomic_store_explicit(&g_ctrace_active_backend, backend, memory_order_release);
 }
 
 void ctrace_flush(void) {
-    int b = g_ctrace_active_backend;
+    int b = atomic_load_explicit(&g_ctrace_active_backend, memory_order_acquire);
     if (b == 1) ctrace_flush_stdout();
     else if (b == 2) ctrace_flush_ringbuf();
     else if (b == 3) ctrace_flush_ctf();
 }
 
 void ctrace_shutdown(void) {
-    int b = g_ctrace_active_backend;
-    g_ctrace_active_backend = 0;
+    int b = atomic_exchange_explicit(&g_ctrace_active_backend, 0, memory_order_acq_rel);
     if (b == 1) ctrace_shutdown_stdout();
     else if (b == 2) ctrace_shutdown_ringbuf();
     else if (b == 3) ctrace_shutdown_ctf();

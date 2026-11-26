@@ -1283,7 +1283,7 @@ int main(int argc, char **argv) {
         for (const auto &pair : events) {
             const Event &ev = pair.second;
             h << "#define __ctrace_emit_" << ev.name << "(...) do { \\\n";
-            h << "    switch (g_ctrace_active_backend) { \\\n";
+            h << "    switch (__atomic_load_n(&g_ctrace_active_backend, __ATOMIC_RELAXED)) { \\\n";
             h << "        case 1: __ctrace_emit_stdout_" << ev.name << "(__VA_ARGS__); break; \\\n";
             h << "        case 2: __ctrace_emit_bin_" << ev.name << "(__VA_ARGS__); break; \\\n";
             h << "        case 3: __ctrace_emit_ctf_" << ev.name << "(__VA_ARGS__); break; \\\n";

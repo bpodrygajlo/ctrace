@@ -86,7 +86,7 @@ public:
         return obj_val_.find(key) != obj_val_.end();
     }
 
-    const json &value(const std::string &key, const json &def) const {
+    json value(const std::string &key, const json &def) const {
         if (!contains(key)) return def;
         return (*this)[key];
     }

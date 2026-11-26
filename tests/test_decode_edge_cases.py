@@ -51,6 +51,22 @@ def main():
         res = subprocess.run([decoder_bin, schema_path, garbage_bin], capture_output=True, timeout=5)
         assert res.returncode != 0, f"Expected non-zero exit code for trailing unparsed bytes, got {res.returncode}"
 
+        # 5. Test truncated CountedArray payload (event 1 has counted array `sensors`)
+        # blen claims 64 bytes, but only 4 bytes follow -> must exit non-zero immediately without hanging
+        trunc_ca_bin = os.path.join(tmpdir, "trunc_ca.bin")
+        with open(trunc_ca_bin, "wb") as f:
+            # event 1: id=1, ts=1000, batch_id=1, num_sensors=2, sensors blen=64, but only 4 bytes follow
+            f.write(struct.pack("<HQ", 1, 1000) + struct.pack("<iH", 101, 2) + struct.pack("<I", 64) + b"\x01\x02\x03\x04")
+        res = subprocess.run([decoder_bin, schema_path, trunc_ca_bin], capture_output=True, timeout=5)
+        assert res.returncode != 0, f"Expected non-zero exit code for truncated CountedArray, got {res.returncode}"
+
+        # 6. Test corrupt / malformed .zst file
+        corrupt_zst = os.path.join(tmpdir, "corrupt.zst")
+        with open(corrupt_zst, "wb") as f:
+            f.write(struct.pack("<I", 100) + b"\xde\xad\xbe\xef\x00\x01\x02")
+        res = subprocess.run([decoder_bin, schema_path, corrupt_zst], capture_output=True, timeout=5)
+        assert res.returncode != 0, f"Expected non-zero exit code for corrupt ZSTD file, got {res.returncode}"
+
     print("All ctrace-decode edge case tests passed successfully!")
 
 if __name__ == "__main__":
