@@ -458,36 +458,54 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
             offset += 4;
             if (total_len - offset < blen) return false;
             size_t end_off = offset + blen;
-            out.write_char('[');
             if (!fld.sub_fields.empty()) {
                 const auto &elem = fld.sub_fields[0];
-                size_t idx = 0;
-                while (offset < end_off) {
-                    if (idx++ > 0) out.write_str(", ");
-                    if (elem.type == FieldType::Struct) {
+                if (elem.type == FieldType::Struct) {
+                    out.write_char('[');
+                    size_t idx = 0;
+                    std::vector<std::pair<std::string, int64_t>> elem_tags;
+                    while (offset < end_off) {
+                        if (idx++ > 0) out.write_str(", ");
                         out.write_char('{');
+                        elem_tags.clear();
                         for (size_t j = 0; j < elem.sub_fields.size(); ++j) {
                             if (j > 0) out.write_str(", ");
                             out.write_char('\'');
                             out.write_str(elem.sub_fields[j].name);
                             out.write_str("': ");
-                            if (!decodeFieldValue(stream, offset, end_off, elem.sub_fields[j], out, nullptr, nullptr, true)) {
+                            if (!decodeFieldValue(stream, offset, end_off, elem.sub_fields[j], out, &elem_tags, &elem_tags, true)) {
                                 return false;
                             }
                         }
                         out.write_char('}');
-                    } else {
+                    }
+                    out.write_char(']');
+                    return true;
+                } else if (elem.size == 1 && (elem.type == FieldType::U8 || elem.type == FieldType::I8)) {
+                    if (inside_dict) out.write_char('\'');
+                    out.write_hex(stream + offset, blen);
+                    if (inside_dict) out.write_char('\'');
+                    offset = end_off;
+                    return true;
+                } else {
+                    out.write_char('[');
+                    size_t idx = 0;
+                    while (offset < end_off) {
+                        if (idx++ > 0) out.write_str(", ");
                         if (!decodeFieldValue(stream, offset, end_off, elem, out, nullptr, nullptr, false)) {
                             return false;
                         }
                     }
+                    out.write_char(']');
+                    return true;
                 }
             } else {
+                if (inside_dict) out.write_char('\'');
                 out.write_hex(stream + offset, blen);
+                if (inside_dict) out.write_char('\'');
                 offset = end_off;
+                return true;
             }
-            out.write_char(']');
-            return true;
         }
         case FieldType::Union: {
             size_t sz = fld.size;

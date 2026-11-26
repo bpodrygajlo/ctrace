@@ -37,6 +37,9 @@ struct Field {
 
     std::string struct_name;
     std::vector<Field> struct_fields;
+
+    bool is_anonymous = false;
+    std::string first_member_name;
 };
 
 struct Event {
@@ -59,6 +62,15 @@ void parseField(const json &jf, Field &f) {
     f.counted_by = jf.value("counted_by", "");
     f.array_len = jf.value("array_len", 0ULL);
     f.tag_field = jf.value("tag_field", "");
+    f.is_anonymous = jf.value("is_anonymous", false);
+    f.first_member_name = jf.value("first_member_name", "");
+
+    if (jf.contains("tag_val")) {
+        f.array_index = (int)jf.value("tag_val", (int64_t)f.array_index);
+    }
+    if (jf.contains("tag_val_str")) {
+        f.array_parent = jf.value("tag_val_str", f.array_parent);
+    }
 
     if (jf.contains("enum_name")) {
         f.enum_name = jf.value("enum_name", "");
@@ -128,6 +140,8 @@ struct FlatField {
     std::string tag_field;
     uint64_t elem_size = 0;
     std::vector<Field> struct_fields;
+    bool is_anonymous = false;
+    std::string first_member_name;
 };
 
 std::string getCountExpr(const std::string &accessor, const std::string &countField) {
@@ -150,6 +164,8 @@ void flattenFieldInternal(const Field &f, const std::string &prefix, const std::
             std::string nextAccessor;
             if (sub.array_index >= 0) {
                 nextAccessor = accessor + op + sub.array_parent + "[" + std::to_string(sub.array_index) + "]";
+            } else if (sub.is_anonymous && !sub.first_member_name.empty()) {
+                nextAccessor = accessor + op + sub.first_member_name;
             } else {
                 nextAccessor = accessor + op + sub.name;
             }
@@ -170,6 +186,8 @@ void flattenFieldInternal(const Field &f, const std::string &prefix, const std::
         ff.array_len = f.array_len;
         ff.tag_field = f.tag_field;
         ff.struct_fields = f.struct_fields;
+        ff.is_anonymous = f.is_anonymous;
+        ff.first_member_name = f.first_member_name;
         if (!f.struct_fields.empty()) {
             ff.elem_size = f.struct_fields[0].size;
         }
@@ -246,10 +264,16 @@ json schemaFieldToJson(const Field &f) {
     j["size"] = f.size;
     j["is_signed"] = f.is_signed;
     if (f.is_pointer) j["is_pointer"] = true;
+    if (f.is_anonymous) {
+        j["is_anonymous"] = true;
+        j["first_member_name"] = f.first_member_name;
+    }
     if (!f.counted_by.empty()) j["counted_by"] = f.counted_by;
     if (f.array_index >= 0) {
         j["array_index"] = f.array_index;
         j["array_parent"] = f.array_parent;
+        j["tag_val"] = f.array_index;
+        j["tag_val_str"] = f.array_parent;
     }
     if (f.type_kind == "enum") {
         j["enum_name"] = f.enum_name;
@@ -491,6 +515,12 @@ void emitCountedArraySerialize(std::ostringstream &h, const FlatField &ff, const
                 h << "        uint8_t _bv = (" << sf.accessor_expr << ") ? 1 : 0; memcpy(_p, &_bv, 1); _p += 1;" << eol;
             } else if (isCtf && sf.type_kind == "enum") {
                 h << "        int32_t _ev = (int32_t)(" << sf.accessor_expr << "); memcpy(_p, &_ev, 4); _p += 4;" << eol;
+            } else if (sf.type_kind == "fixed_array") {
+                h << "        memcpy(_p, (const void *)(" << sf.accessor_expr << "), " << sf.size << "); _p += " << sf.size << ";" << eol;
+            } else if (sf.type_kind == "union") {
+                h << "        memcpy(_p, (const void *)(&(" << sf.accessor_expr << ")), " << sf.size << "); _p += " << sf.size << ";" << eol;
+            } else if (sf.is_pointer) {
+                h << "        uint" << (sf.size * 8) << "_t _pv = (uint" << (sf.size * 8) << "_t)(uintptr_t)(" << sf.accessor_expr << "); memcpy(_p, &_pv, " << sf.size << "); _p += " << sf.size << ";" << eol;
             } else {
                 h << "        { __typeof__(" << sf.accessor_expr << ") _tmp = (" << sf.accessor_expr << "); memcpy(_p, &_tmp, " << sf.size << "); _p += " << sf.size << "; }" << eol;
             }

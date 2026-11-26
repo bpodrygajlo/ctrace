@@ -36,7 +36,7 @@ def main():
     u_fld = next(f for f in pdu_struct["fields"] if f["name"] == "u")
     assert u_fld["type"] == "union", f"Expected union type, got {u_fld['type']}"
     assert u_fld["tag_field"] == "pdu_type", f"Expected tag_field 'pdu_type', got {u_fld['tag_field']}"
-    assert "union_cases" in u_fld and len(u_fld["union_cases"]) == 2, f"Expected 2 union cases, got {u_fld.get('union_cases')}"
+    assert "union_cases" in u_fld and len(u_fld["union_cases"]) == 3, f"Expected 3 union cases, got {u_fld.get('union_cases')}"
 
     # 2. Decode binary stream
     if decode_tool.endswith(".py"):
@@ -56,6 +56,23 @@ def main():
     assert "'tti': 1001" in out
     assert "pdcch_pdu" in out
     assert "'freq_domain': 43981" in out # 0xABCD = 43981
+
+    # Verify multiple tag values mapping to same union case (tag 2 -> dlsch_pdu)
+    assert "'tti': 2002" in out
+    assert "'mcs': 14" in out
+
+    # Verify fixed array inside element of counted struct array
+    assert "fapi_dci_event" in out
+    assert "'size': 5" in out
+    assert "'bits': [170, 187, 204" in out
+
+    # Verify anonymous discriminated union
+    assert "fapi_anon_event" in out
+    assert "'pucch': {'b': 8888, 'c': 99}" in out
+
+    # Verify count-bound byte payload decoded as hex string (like TRACE_BYTES)
+    assert "fapi_rx_event" in out
+    assert "deadbeef" in out
 
     print("All FAPI union, fixed-array, and dynamic count binding assertions PASSED!")
 

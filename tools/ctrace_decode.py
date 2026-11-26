@@ -166,6 +166,10 @@ def decode_field_value(stream_data, offset, total_len, fld, current_record=None)
 
         elem_schema = sub_fields[0]
         elem_type = elem_schema.get("type", "uint8")
+        if elem_schema.get("size") == 1 and elem_type in ("uint8", "int8", "char"):
+            b_data = stream_data[offset:end_offset]
+            return b_data.hex(), end_offset
+
         items = []
         sub_off = offset
 

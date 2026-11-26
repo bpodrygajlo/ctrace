@@ -53,6 +53,9 @@ struct FieldInfo {
     // For structs / counted_array
     std::string struct_name;
     std::vector<FieldInfo> struct_fields;
+
+    bool is_anonymous = false;
+    std::string first_member_name;
 };
 
 struct EventInfo {
@@ -75,6 +78,8 @@ struct UnionCaseBinding {
 
 std::map<std::pair<std::string, std::string>, std::string> g_bound_counts;
 std::map<std::string, std::vector<UnionCaseBinding>> g_bound_unions;
+std::map<const RecordDecl *, std::vector<UnionCaseBinding>> g_bound_unions_by_rd;
+std::map<std::pair<const RecordDecl *, std::string>, std::string> g_bound_counts_by_rd;
 
 std::string stripStructPrefix(const std::string &s) {
     if (s.rfind("struct ", 0) == 0) return s.substr(7);
@@ -267,23 +272,45 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
 
             // Check if field is a union (named or anonymous)
             if (ftCanon->isUnionType()) {
-                std::string uName = fieldName.empty() ? "u" : fieldName;
+                bool isAnon = fieldName.empty();
+                std::string firstMember;
                 const auto *RT = ftCanon->getAs<RecordType>();
                 const RecordDecl *UD = RT ? RT->getDecl() : nullptr;
                 if (UD && UD->getDefinition()) UD = UD->getDefinition();
+                if (UD) {
+                    for (const FieldDecl *UFD : UD->fields()) {
+                        if (!UFD->getNameAsString().empty()) {
+                            firstMember = UFD->getNameAsString();
+                            break;
+                        }
+                    }
+                }
+                std::string uName = isAnon ? "u" : fieldName;
                 uint64_t unionSize = Ctx.getTypeSize(ftCanon) / 8;
 
-                auto itU = g_bound_unions.find(sName);
-                if (itU != g_bound_unions.end() && !itU->second.empty()) {
+                const std::vector<UnionCaseBinding> *pBindings = nullptr;
+                auto itURD = g_bound_unions_by_rd.find(RD);
+                if (itURD != g_bound_unions_by_rd.end() && !itURD->second.empty()) {
+                    pBindings = &itURD->second;
+                } else {
+                    auto itU = g_bound_unions.find(sName);
+                    if (itU != g_bound_unions.end() && !itU->second.empty()) {
+                        pBindings = &itU->second;
+                    }
+                }
+
+                if (pBindings && !pBindings->empty()) {
                     FieldInfo uf;
                     uf.name = uName;
+                    uf.is_anonymous = isAnon;
+                    uf.first_member_name = firstMember;
                     uf.type_kind = "union";
                     uf.c_type = ft.getAsString();
                     uf.size = unionSize;
-                    uf.counted_by = itU->second[0].tag_field;
+                    uf.counted_by = (*pBindings)[0].tag_field;
 
                     if (UD) {
-                        for (const auto &ub : itU->second) {
+                        for (const auto &ub : *pBindings) {
                             for (const FieldDecl *UFD : UD->fields()) {
                                 if (UFD->getNameAsString() == ub.member_name) {
                                     FieldInfo mInfo = resolveFieldType(UFD->getType(), ub.member_name, Ctx, depth + 1);
@@ -301,6 +328,8 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                     // Fallback: unannotated union is preserved as raw bytes of sizeof(union)
                     FieldInfo uf;
                     uf.name = uName;
+                    uf.is_anonymous = isAnon;
+                    uf.first_member_name = firstMember;
                     uf.type_kind = "bytes";
                     uf.c_type = ft.getAsString();
                     uf.size = unionSize;
@@ -315,10 +344,15 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
 
             // Check count binding (CTRACE_COUNTED_BY or CTRACE_BIND_COUNT)
             std::string countField = getCountedByField(FD);
-            if (countField.empty() && !sName.empty()) {
-                auto itC = g_bound_counts.find({sName, fieldName});
-                if (itC != g_bound_counts.end()) {
-                    countField = itC->second;
+            if (countField.empty()) {
+                auto itCRD = g_bound_counts_by_rd.find({RD, fieldName});
+                if (itCRD != g_bound_counts_by_rd.end()) {
+                    countField = itCRD->second;
+                } else if (!sName.empty()) {
+                    auto itC = g_bound_counts.find({sName, fieldName});
+                    if (itC != g_bound_counts.end()) {
+                        countField = itC->second;
+                    }
                 }
             }
 
@@ -326,6 +360,10 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                 QualType elemType;
                 if (ft->isPointerType()) {
                     elemType = ft->getPointeeType();
+                } else if (const auto *IAT = Ctx.getAsIncompleteArrayType(ft)) {
+                    elemType = IAT->getElementType();
+                } else if (const auto *CAT = Ctx.getAsConstantArrayType(ft)) {
+                    elemType = CAT->getElementType();
                 } else if (ftCanon->isIncompleteArrayType()) {
                     const auto *IAT = Ctx.getAsIncompleteArrayType(ftCanon);
                     elemType = IAT->getElementType();
@@ -568,6 +606,18 @@ public:
                 if (parts.size() >= 5) {
                     std::string typeName = stripStructPrefix(parts[2]);
                     g_bound_counts[{typeName, parts[3]}] = parts[4];
+
+                    QualType qt = VD->getType();
+                    if (qt->isPointerType()) {
+                        QualType pt = qt->getPointeeType().getCanonicalType();
+                        if (const auto *RT = pt->getAs<RecordType>()) {
+                            const RecordDecl *RD = RT->getDecl()->getDefinition();
+                            if (!RD) RD = RT->getDecl();
+                            if (RD) {
+                                g_bound_counts_by_rd[{RD, parts[3]}] = parts[4];
+                            }
+                        }
+                    }
                 }
             } else if (ann.rfind("ctrace:bind_union:", 0) == 0) {
                 // format: ctrace:bind_union:type:tag_field:tag_val:member_name
@@ -586,9 +636,22 @@ public:
                         ub.has_numeric_tag = true;
                     } catch (...) {}
                     g_bound_unions[typeName].push_back(ub);
+
+                    QualType qt = VD->getType();
+                    if (qt->isPointerType()) {
+                        QualType pt = qt->getPointeeType().getCanonicalType();
+                        if (const auto *RT = pt->getAs<RecordType>()) {
+                            const RecordDecl *RD = RT->getDecl()->getDefinition();
+                            if (!RD) RD = RT->getDecl();
+                            if (RD) {
+                                g_bound_unions_by_rd[RD].push_back(ub);
+                            }
+                        }
+                    }
                 }
             } else if (ann.rfind("ctrace:bind_union_val:", 0) == 0) {
                 // evaluate integer value if available
+                // format: ctrace:bind_union_val:type:tag_field:tag_val:member_name
                 if (VD->hasInit()) {
                     Expr::EvalResult res;
                     if (VD->getInit()->EvaluateAsInt(res, *Ctx)) {
@@ -597,13 +660,22 @@ public:
                         std::stringstream ss(ann);
                         std::string item;
                         while (std::getline(ss, item, ':')) parts.push_back(item);
-                        if (parts.size() >= 5) {
+                        if (parts.size() >= 6) {
                             std::string typeName = stripStructPrefix(parts[2]);
-                            std::string memberName = parts[4];
+                            std::string tagValStr = parts[4];
+                            std::string memberName = parts[5];
                             for (auto &ub : g_bound_unions[typeName]) {
-                                if (ub.member_name == memberName) {
+                                if (ub.member_name == memberName && ub.tag_val_str == tagValStr) {
                                     ub.tag_val = val;
                                     ub.has_numeric_tag = true;
+                                }
+                            }
+                            for (auto &pair : g_bound_unions_by_rd) {
+                                for (auto &ub : pair.second) {
+                                    if (ub.member_name == memberName && ub.tag_val_str == tagValStr) {
+                                        ub.tag_val = val;
+                                        ub.has_numeric_tag = true;
+                                    }
                                 }
                             }
                         }
@@ -663,6 +735,10 @@ json fieldInfoToJson(const FieldInfo &f) {
     j["size"] = f.size;
     j["is_signed"] = f.is_signed;
     j["is_pointer"] = f.is_pointer;
+    if (f.is_anonymous) {
+        j["is_anonymous"] = true;
+        j["first_member_name"] = f.first_member_name;
+    }
     if (!f.counted_by.empty()) {
         j["counted_by"] = f.counted_by;
     }
