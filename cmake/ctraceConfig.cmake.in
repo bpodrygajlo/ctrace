@@ -1,0 +1,21 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+set(CTRACE_HAVE_SQLITE @CTRACE_HAVE_SQLITE@)
+set(CTRACE_HAVE_ZSTD @CTRACE_HAVE_ZSTD@)
+
+if(CTRACE_HAVE_SQLITE)
+    find_dependency(SQLite3)
+endif()
+if(CTRACE_HAVE_ZSTD)
+    find_library(ZSTD_LIB NAMES zstd)
+endif()
+
+set_and_check(CTRACE_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+include("${CMAKE_CURRENT_LIST_DIR}/ctrace.cmake")
+
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/ctraceTargets.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/ctraceTargets.cmake")
+endif()

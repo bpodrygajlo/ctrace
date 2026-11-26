@@ -1,0 +1,573 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <filesystem>
+
+#include <clang/AST/ASTConsumer.h>
+#include <clang/AST/ASTContext.h>
+#include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/AST/Type.h>
+#include <clang/AST/Decl.h>
+#include <clang/AST/Expr.h>
+#include <clang/Frontend/CompilerInstance.h>
+#include <clang/Frontend/FrontendAction.h>
+#include <clang/Frontend/FrontendActions.h>
+#include <clang/Tooling/CommonOptionsParser.h>
+#include <clang/Tooling/CompilationDatabase.h>
+#include <clang/Tooling/Tooling.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/FileSystem.h>
+
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+using namespace clang;
+using namespace clang::tooling;
+
+namespace {
+
+struct EnumConstant {
+    std::string name;
+    int64_t value = 0;
+};
+
+struct FieldInfo {
+    std::string name;
+    std::string type_kind; // int8..int64, uint8..uint64, float, double, bool, string, bytes, enum, struct
+    std::string c_type;
+    uint64_t size = 0;
+    bool is_signed = false;
+    bool is_pointer = false;
+    int array_index = -1;
+    std::string array_parent;
+    std::string counted_by;
+
+    // For enums
+    std::string enum_name;
+    std::vector<EnumConstant> enum_constants;
+
+    // For structs
+    std::string struct_name;
+    std::vector<FieldInfo> struct_fields;
+};
+
+struct EventInfo {
+    std::string name;
+    std::string file;
+    unsigned line = 0;
+    unsigned column = 0;
+    std::vector<FieldInfo> fields;
+};
+
+std::map<std::tuple<std::string, std::string, unsigned>, EventInfo> g_collected_events;
+
+std::string getCountedByField(const FieldDecl *FD) {
+    if (!FD) return "";
+    for (const auto *A : FD->specific_attrs<AnnotateAttr>()) {
+        std::string ann = A->getAnnotation().str();
+        if (ann.rfind("ctrace:counted_by:", 0) == 0) {
+            return ann.substr(18);
+        }
+    }
+    return "";
+}
+
+std::string getSanitizedMemberPath(const Expr *e) {
+    if (!e) return "";
+    e = e->IgnoreParenImpCasts();
+    if (const auto *ME = dyn_cast<MemberExpr>(e)) {
+        std::string base = getSanitizedMemberPath(ME->getBase());
+        std::string member = ME->getMemberDecl()->getNameAsString();
+        if (base.empty()) return member;
+        return base + "_" + member;
+    }
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(e)) {
+        return DRE->getDecl()->getNameAsString();
+    }
+    return "";
+}
+
+std::string extractFieldName(const Expr *rawExpr, unsigned fieldIdx) {
+    if (!rawExpr) return "arg_" + std::to_string(fieldIdx);
+    const Expr *e = rawExpr->IgnoreParenImpCasts();
+
+    if (const auto *UO = dyn_cast<UnaryOperator>(e)) {
+        if (UO->getOpcode() == UO_Deref || UO->getOpcode() == UO_AddrOf) {
+            return extractFieldName(UO->getSubExpr(), fieldIdx);
+        }
+    }
+
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(e)) {
+        std::string name = DRE->getDecl()->getNameAsString();
+        if (!name.empty()) return name;
+    }
+
+    std::string memberPath = getSanitizedMemberPath(e);
+    if (!memberPath.empty()) {
+        return memberPath;
+    }
+
+    return "arg_" + std::to_string(fieldIdx);
+}
+
+bool isCtraceBytesType(QualType QT, ASTContext &Ctx) {
+    std::string s1 = QT.getAsString();
+    if (s1.find("ctrace_bytes_t") != std::string::npos) return true;
+    std::string s2 = QT.getDesugaredType(Ctx).getAsString();
+    if (s2.find("ctrace_bytes_t") != std::string::npos) return true;
+    if (const auto *RT = QT->getAs<RecordType>()) {
+        if (RT->getDecl()->getNameAsString() == "ctrace_bytes_t") return true;
+    }
+    return false;
+}
+
+bool isStringType(QualType QT) {
+    if (QT->isPointerType()) {
+        QualType p = QT->getPointeeType();
+        if (p->isCharType()) return true;
+    }
+    if (QT->isArrayType()) {
+        const auto *AT = dyn_cast<ArrayType>(QT.getTypePtr());
+        if (AT && AT->getElementType()->isCharType()) return true;
+    }
+    return false;
+}
+
+FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContext &Ctx, int depth = 0) {
+    FieldInfo f;
+    f.name = name;
+    f.c_type = qualType.getAsString();
+    QualType canon = qualType.getCanonicalType();
+
+    // 1. Check ctrace_bytes_t
+    if (isCtraceBytesType(qualType, Ctx)) {
+        f.type_kind = "bytes";
+        f.c_type = "ctrace_bytes_t";
+        f.size = Ctx.getTypeSize(canon) / 8;
+        return f;
+    }
+
+    // 2. Check string (char*, const char*, char[N])
+    if (isStringType(qualType)) {
+        f.type_kind = "string";
+        f.c_type = "const char *";
+        f.size = sizeof(void *);
+        return f;
+    }
+
+    // 3. Check bool
+    if (canon->isBooleanType()) {
+        f.type_kind = "bool";
+        f.c_type = "bool";
+        f.size = 1;
+        return f;
+    }
+
+    // 4. Check enum
+    if (canon->isEnumeralType()) {
+        f.type_kind = "enum";
+        const auto *ET = canon->getAs<EnumType>();
+        const EnumDecl *ED = ET->getDecl()->getDefinition();
+        if (!ED) ED = ET->getDecl();
+
+        f.enum_name = ED->getNameAsString();
+        if (f.enum_name.empty()) {
+            if (const auto *TND = ED->getTypedefNameForAnonDecl()) {
+                f.enum_name = TND->getNameAsString();
+            }
+        }
+        if (f.enum_name.empty()) {
+            if (const auto *TT = qualType->getAs<TypedefType>()) {
+                f.enum_name = TT->getDecl()->getNameAsString();
+            }
+        }
+        f.c_type = f.enum_name.empty() ? ED->getIntegerType().getAsString() : (ED->getNameAsString().empty() ? f.enum_name : "enum " + f.enum_name);
+        f.size = Ctx.getTypeSize(canon) / 8;
+        f.is_signed = ED->getIntegerType()->isSignedIntegerType();
+
+        for (auto it = ED->enumerator_begin(); it != ED->enumerator_end(); ++it) {
+            EnumConstant ec;
+            ec.name = it->getNameAsString();
+            ec.value = it->getInitVal().getExtValue();
+            f.enum_constants.push_back(ec);
+        }
+        return f;
+    }
+
+    // 5. Check struct
+    if ((canon->isStructureType() || canon->isRecordType()) && depth < 4) {
+        f.type_kind = "struct";
+        const auto *RT = canon->getAs<RecordType>();
+        const RecordDecl *RD = RT->getDecl()->getDefinition();
+        if (!RD) RD = RT->getDecl();
+
+        f.struct_name = RD->getNameAsString();
+        if (f.struct_name.empty()) {
+            if (const auto *TND = RD->getTypedefNameForAnonDecl()) {
+                f.struct_name = TND->getNameAsString();
+            }
+        }
+        if (f.struct_name.empty()) {
+            if (const auto *TT = qualType->getAs<TypedefType>()) {
+                f.struct_name = TT->getDecl()->getNameAsString();
+            }
+        }
+        f.c_type = f.struct_name.empty() ? qualType.getAsString() : (RD->getNameAsString().empty() ? f.struct_name : "struct " + f.struct_name);
+        f.size = Ctx.getTypeSize(canon) / 8;
+
+        for (const FieldDecl *FD : RD->fields()) {
+            QualType ft = FD->getType();
+            std::string countField = getCountedByField(FD);
+            if (!countField.empty()) {
+                QualType ftCanon = ft.getCanonicalType();
+                QualType elemType;
+                if (ft->isPointerType()) {
+                    elemType = ft->getPointeeType();
+                } else if (ftCanon->isIncompleteArrayType()) {
+                    const auto *IAT = Ctx.getAsIncompleteArrayType(ftCanon);
+                    elemType = IAT->getElementType();
+                } else if (ftCanon->isConstantArrayType()) {
+                    const auto *CAT = Ctx.getAsConstantArrayType(ftCanon);
+                    elemType = CAT->getElementType();
+                }
+                if (!elemType.isNull()) {
+                    FieldInfo elem = resolveFieldType(elemType, FD->getNameAsString() + "_elem", Ctx, depth + 1);
+                    FieldInfo cf;
+                    cf.name = FD->getNameAsString();
+                    cf.type_kind = "counted_array";
+                    cf.c_type = ft.getAsString();
+                    cf.counted_by = countField;
+                    cf.size = elem.size;
+                    cf.struct_fields.push_back(elem);
+                    f.struct_fields.push_back(cf);
+                    continue;
+                }
+            }
+
+            // Skip pointers inside struct (unless string)
+            if (ft->isPointerType() && !isStringType(ft)) {
+                continue;
+            }
+            QualType ftCanon = ft.getCanonicalType();
+            // Skip flexible array members (incomplete arrays e.g. int payload[])
+            if (ftCanon->isIncompleteArrayType()) {
+                continue;
+            }
+            if (ftCanon->isConstantArrayType()) {
+                const auto *CAT = Ctx.getAsConstantArrayType(ftCanon);
+                QualType elemType = CAT->getElementType();
+                if (!elemType->isCharType()) {
+                    uint64_t arrLen = CAT->getSize().getZExtValue();
+                    for (uint64_t idx = 0; idx < arrLen; ++idx) {
+                        std::string elemName = FD->getNameAsString() + "_" + std::to_string(idx);
+                        FieldInfo sub = resolveFieldType(elemType, elemName, Ctx, depth + 1);
+                        sub.array_index = (int)idx;
+                        sub.array_parent = FD->getNameAsString();
+                        f.struct_fields.push_back(sub);
+                    }
+                    continue;
+                }
+            }
+            FieldInfo sub = resolveFieldType(ft, FD->getNameAsString(), Ctx, depth + 1);
+            f.struct_fields.push_back(sub);
+        }
+        return f;
+    }
+
+    // 6. Check floating point
+    if (canon->isRealFloatingType()) {
+        uint64_t bits = Ctx.getTypeSize(canon);
+        if (bits == 32) {
+            f.type_kind = "float";
+            f.c_type = "float";
+            f.size = 4;
+        } else {
+            f.type_kind = "double";
+            f.c_type = "double";
+            f.size = 8;
+        }
+        return f;
+    }
+
+    // 7. Check integer
+    if (canon->isIntegerType()) {
+        uint64_t bits = Ctx.getTypeSize(canon);
+        bool isSigned = canon->isSignedIntegerType();
+        f.is_signed = isSigned;
+        f.size = bits / 8;
+
+        if (bits <= 8) {
+            f.type_kind = isSigned ? "int8" : "uint8";
+        } else if (bits <= 16) {
+            f.type_kind = isSigned ? "int16" : "uint16";
+        } else if (bits <= 32) {
+            f.type_kind = isSigned ? "int32" : "uint32";
+        } else {
+            f.type_kind = isSigned ? "int64" : "uint64";
+        }
+        return f;
+    }
+
+    // 8. Fallback for pointers / other types
+    if (canon->isPointerType()) {
+        QualType pointee = canon->getPointeeType();
+        QualType pCanon = pointee.getCanonicalType();
+        if ((pCanon->isStructureType() || pCanon->isRecordType()) && depth < 4) {
+            FieldInfo s = resolveFieldType(pointee, name, Ctx, depth);
+            s.is_pointer = true;
+            s.c_type = qualType.getAsString();
+            return s;
+        }
+        f.type_kind = "uint64";
+        f.c_type = "uintptr_t";
+        f.size = 8;
+        return f;
+    }
+
+    // Generic fallback
+    f.type_kind = "uint64";
+    f.c_type = "uint64_t";
+    f.size = 8;
+    return f;
+}
+
+class TraceASTVisitor : public RecursiveASTVisitor<TraceASTVisitor> {
+public:
+    explicit TraceASTVisitor(ASTContext *Context) : Ctx(Context) {}
+
+    bool VisitCallExpr(CallExpr *Call) {
+        const FunctionDecl *FD = Call->getDirectCallee();
+        if (!FD) return true;
+
+        if (FD->getNameAsString() != "__ctrace_hook") {
+            return true;
+        }
+
+        if (Call->getNumArgs() < 1) return true;
+
+        // Arg 0 is the event name string literal
+        const Expr *arg0 = Call->getArg(0)->IgnoreParenImpCasts();
+        std::string eventName;
+        if (const auto *SL = dyn_cast<StringLiteral>(arg0)) {
+            eventName = SL->getString().str();
+        } else {
+            return true;
+        }
+
+        SourceManager &SM = Ctx->getSourceManager();
+        SourceLocation loc = Call->getBeginLoc();
+        SourceLocation expLoc = SM.getExpansionLoc(loc);
+        PresumedLoc pLoc = SM.getPresumedLoc(expLoc);
+
+        std::string filename = pLoc.isValid() ? pLoc.getFilename() : "";
+        unsigned line = pLoc.isValid() ? pLoc.getLine() : 0;
+        unsigned column = pLoc.isValid() ? pLoc.getColumn() : 0;
+
+        // Canonicalize file path
+        llvm::SmallString<256> realPath;
+        if (!filename.empty() && !llvm::sys::fs::real_path(filename, realPath)) {
+            filename = realPath.str().str();
+        }
+
+        EventInfo ev;
+        ev.name = eventName;
+        ev.file = filename;
+        ev.line = line;
+        ev.column = column;
+
+        unsigned numArgs = Call->getNumArgs();
+        std::set<std::string> usedNames;
+
+        for (unsigned i = 1; i < numArgs; ++i) {
+            const Expr *argExpr = Call->getArg(i);
+            const Expr *unpromoted = argExpr->IgnoreParenImpCasts();
+            std::string fieldName = extractFieldName(argExpr, i - 1);
+
+            // Ensure field name is unique
+            std::string uniqueName = fieldName;
+            int counter = 1;
+            while (usedNames.count(uniqueName)) {
+                uniqueName = fieldName + "_" + std::to_string(counter++);
+            }
+            usedNames.insert(uniqueName);
+
+            // Use the unpromoted expression's type to accurately detect enums, bools, etc.
+            QualType typeToResolve = unpromoted->getType();
+            // But if unpromoted was an array (e.g. char[]), treat as string
+            if (isStringType(argExpr->getType())) {
+                typeToResolve = argExpr->getType();
+            }
+
+            FieldInfo f = resolveFieldType(typeToResolve, uniqueName, *Ctx);
+            ev.fields.push_back(f);
+        }
+
+        // Deduplicate by (event_name, canonical_file, line)
+        auto key = std::make_tuple(ev.name, ev.file, ev.line);
+        g_collected_events[key] = ev;
+
+        return true;
+    }
+
+private:
+    ASTContext *Ctx;
+};
+
+class TraceASTConsumer : public ASTConsumer {
+public:
+    explicit TraceASTConsumer(ASTContext *Context) : Visitor(Context) {}
+
+    void HandleTranslationUnit(ASTContext &Context) override {
+        Visitor.TraverseDecl(Context.getTranslationUnitDecl());
+    }
+
+private:
+    TraceASTVisitor Visitor;
+};
+
+class TraceFrontendAction : public ASTFrontendAction {
+public:
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef file) override {
+        return std::make_unique<TraceASTConsumer>(&CI.getASTContext());
+    }
+};
+
+static llvm::cl::OptionCategory CtraceScanCategory("ctrace-scan options");
+static llvm::cl::opt<std::string> OutputFilename("o", llvm::cl::desc("Output JSON trace file"), llvm::cl::value_desc("filename"), llvm::cl::cat(CtraceScanCategory));
+
+json fieldInfoToJson(const FieldInfo &f) {
+    json j;
+    j["name"] = f.name;
+    j["type_kind"] = f.type_kind;
+    j["c_type"] = f.c_type;
+    j["size"] = f.size;
+    j["is_signed"] = f.is_signed;
+    j["is_pointer"] = f.is_pointer;
+    if (!f.counted_by.empty()) {
+        j["counted_by"] = f.counted_by;
+    }
+    if (f.array_index >= 0) {
+        j["array_index"] = f.array_index;
+        j["array_parent"] = f.array_parent;
+    }
+
+    if (f.type_kind == "enum") {
+        j["enum_name"] = f.enum_name;
+        json constants = json::array();
+        for (const auto &c : f.enum_constants) {
+            constants.push_back({{"name", c.name}, {"value", c.value}});
+        }
+        j["enum_constants"] = constants;
+    } else if (f.type_kind == "struct" || f.type_kind == "counted_array") {
+        if (!f.struct_name.empty()) {
+            j["struct_name"] = f.struct_name;
+        }
+        json subfields = json::array();
+        for (const auto &sub : f.struct_fields) {
+            subfields.push_back(fieldInfoToJson(sub));
+        }
+        j["struct_fields"] = subfields;
+    }
+    return j;
+}
+
+class FallbackCompilationDatabase : public CompilationDatabase {
+public:
+    FallbackCompilationDatabase(const CompilationDatabase &Base, std::vector<std::string> FallbackFlags)
+        : BaseDb(Base), Flags(std::move(FallbackFlags)) {}
+
+    std::vector<CompileCommand> getCompileCommands(StringRef FilePath) const override {
+        auto cmds = BaseDb.getCompileCommands(FilePath);
+        if (!cmds.empty()) return cmds;
+        std::vector<std::string> args = {"clang"};
+        args.insert(args.end(), Flags.begin(), Flags.end());
+        args.push_back(FilePath.str());
+        return {CompileCommand(".", FilePath.str(), args, "clang")};
+    }
+
+    std::vector<std::string> getAllFiles() const override {
+        return BaseDb.getAllFiles();
+    }
+
+    std::vector<CompileCommand> getAllCompileCommands() const override {
+        return BaseDb.getAllCompileCommands();
+    }
+
+private:
+    const CompilationDatabase &BaseDb;
+    std::vector<std::string> Flags;
+};
+
+} // namespace
+
+int main(int argc, const char **argv) {
+    auto ExpectedParser = CommonOptionsParser::create(argc, argv, CtraceScanCategory, llvm::cl::ZeroOrMore);
+    if (!ExpectedParser) {
+        llvm::errs() << ExpectedParser.takeError();
+        return 1;
+    }
+
+    CommonOptionsParser &OptionsParser = ExpectedParser.get();
+
+    // Extract extra-arg values passed from command line
+    std::vector<std::string> extraFlags = {"-DCTRACE_AST_SCAN"};
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a.rfind("--extra-arg=", 0) == 0) {
+            extraFlags.push_back(a.substr(12));
+        }
+    }
+
+    FallbackCompilationDatabase FallbackDb(OptionsParser.getCompilations(), extraFlags);
+    ClangTool Tool(FallbackDb, OptionsParser.getSourcePathList());
+
+    int result = Tool.run(newFrontendActionFactory<TraceFrontendAction>().get());
+    if (result != 0) {
+        llvm::errs() << "Warning: ClangTool returned non-zero code: " << result << "\n";
+    }
+
+    json root = json::object();
+    json eventsArray = json::array();
+
+    for (const auto &entry : g_collected_events) {
+        const EventInfo &ev = entry.second;
+        json evObj = json::object();
+        evObj["name"] = ev.name;
+        evObj["file"] = ev.file;
+        evObj["line"] = ev.line;
+        evObj["column"] = ev.column;
+
+        json fields = json::array();
+        for (const auto &f : ev.fields) {
+            fields.push_back(fieldInfoToJson(f));
+        }
+        evObj["fields"] = fields;
+        eventsArray.push_back(evObj);
+    }
+
+    root["events"] = eventsArray;
+
+    std::string outPath = OutputFilename;
+    if (outPath.size() >= 2 && outPath.front() == '"' && outPath.back() == '"') {
+        outPath = outPath.substr(1, outPath.size() - 2);
+    }
+    if (!outPath.empty()) {
+        std::filesystem::create_directories(std::filesystem::path(outPath).parent_path());
+    }
+    if (outPath.empty()) {
+        std::cout << root.dump(2) << std::endl;
+    } else {
+        std::ofstream outFile(outPath);
+        if (!outFile) {
+            llvm::errs() << "Error: Could not open output file: " << outPath << "\n";
+            return 1;
+        }
+        outFile << root.dump(2) << std::endl;
+    }
+
+    return 0;
+}

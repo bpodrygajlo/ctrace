@@ -1,0 +1,20 @@
+# Build directories
+build/
+build*/
+cpm_build/
+
+# Compilation database
+compile_commands.json
+
+# IDE / Tooling artifacts
+.cache/
+.vscode/
+.idea/
+
+# Trace outputs & logs
+*.bin
+*.bin.zst
+*.log
+*.db
+trace_ctf/
+test_*_trace/
