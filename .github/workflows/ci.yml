@@ -34,7 +34,7 @@ jobs:
             os: ubuntu-24.04
             cc: gcc
             cxx: g++
-            cmake_flags: "-DCTRACE_ENABLE_ZSTD=OFF -DCTRACE_ENABLE_SQLITE=OFF"
+            cmake_flags: "-DCTRACE_ENABLE_ZSTD=OFF -DCTRACE_ENABLE_SQLITE=OFF -DCTRACE_FORCE_BUILTIN_JSON=ON"
 
     steps:
       - name: Checkout Repository

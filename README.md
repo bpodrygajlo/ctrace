@@ -308,22 +308,22 @@ TRACE_EVENT(wire_frame, frame);
 * Linux (x86_64, AArch64)
 * CMake $\ge$ 3.20
 * Clang / LLVM $\ge$ 17 (development libraries: `libclang-18-dev`, `llvm-18-dev`)
-* `nlohmann-json3-dev`
-* **Optional Backends:**
-  * `libzstd-dev` (only required for `-DCTRACE_ENABLE_ZSTD=ON`, auto-detected)
-  * `libsqlite3-dev` (only required for `-DCTRACE_ENABLE_SQLITE=ON`, auto-detected)
+* **Optional Dependencies (all auto-detected with graceful fallback):**
+  * `nlohmann-json3-dev` (optional; falls back automatically to built-in C++17 JSON implementation in `tools/common/ctrace_json.hpp`)
+  * `libzstd-dev` (only required for `-DCTRACE_ENABLE_ZSTD=ON`)
+  * `libsqlite3-dev` (only required for `-DCTRACE_ENABLE_SQLITE=ON`)
   * `babeltrace2` (optional test utility for CTF trace inspection)
 
 > [!TIP]
-> The core backends (`stdout`, `bin`, and `ctf`) are **100% self-contained** and require zero external C libraries beyond standard C/POSIX pthreads.
+> The core backends (`stdout`, `bin`, and `ctf`) and build tools require **zero external C/C++ libraries** beyond standard POSIX pthreads and Clang/LLVM.
 
 On Ubuntu / Debian:
 ```bash
-# Minimal install (core backends: stdout, bin, ctf):
-sudo apt-get install -y cmake clang libclang-18-dev llvm-18-dev nlohmann-json3-dev
+# Minimal install (core backends: stdout, bin, ctf — no external JSON/Zstd/SQLite libs needed):
+sudo apt-get install -y cmake clang libclang-18-dev llvm-18-dev
 
-# Full install (including SQLite and Zstandard backends):
-sudo apt-get install -y cmake clang libclang-18-dev llvm-18-dev nlohmann-json3-dev \
+# Full install (including optional SQLite and Zstandard backends):
+sudo apt-get install -y cmake clang libclang-18-dev llvm-18-dev \
     libsqlite3-dev libzstd-dev babeltrace2
 ```
 

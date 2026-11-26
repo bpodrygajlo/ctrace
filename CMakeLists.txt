@@ -13,7 +13,8 @@ set_property(CACHE CTRACE_BACKEND PROPERTY STRINGS "stdout" "bin" "bin-zstd" "sq
 
 # Options for external library dependencies
 option(CTRACE_ENABLE_ZSTD "Enable Zstandard compressed trace backend (bin-zstd)" ON)
-option(CTRACE_ENABLE_SQLITE "Enable SQLite3 in-memory database backend" ON)
+option(CTRACE_ENABLE_SQLITE "Enable SQLite3 database backend" ON)
+option(CTRACE_FORCE_BUILTIN_JSON "Use built-in JSON parser in tools instead of system nlohmann_json" OFF)
 
 # Dependencies
 find_package(Threads REQUIRED)
@@ -59,6 +60,11 @@ if(NOT Clang_FOUND)
 endif()
 
 find_package(nlohmann_json QUIET)
+if(nlohmann_json_FOUND AND NOT CTRACE_FORCE_BUILTIN_JSON)
+    message(STATUS "ctrace: Using system nlohmann_json for build tools")
+else()
+    message(STATUS "ctrace: Using built-in C++17 JSON implementation (tools/common/ctrace_json.hpp)")
+endif()
 
 # Header-only interface target
 add_library(ctrace_headers INTERFACE)
@@ -71,16 +77,21 @@ add_library(ctrace::ctrace_headers ALIAS ctrace_headers)
 
 # Tool 1: ctrace-scan (AST Extractor)
 add_executable(ctrace-scan tools/ctrace-scan/main.cpp)
-target_include_directories(ctrace-scan PRIVATE ${CLANG_INCLUDE_DIRS})
+target_include_directories(ctrace-scan PRIVATE ${CLANG_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tools/common)
 target_link_libraries(ctrace-scan PRIVATE clang-cpp LLVM)
-if(TARGET nlohmann_json::nlohmann_json)
+if(CTRACE_FORCE_BUILTIN_JSON)
+    target_compile_definitions(ctrace-scan PRIVATE CTRACE_FORCE_BUILTIN_JSON)
+elseif(TARGET nlohmann_json::nlohmann_json)
     target_link_libraries(ctrace-scan PRIVATE nlohmann_json::nlohmann_json)
 endif()
 add_executable(ctrace::ctrace-scan ALIAS ctrace-scan)
 
 # Tool 2: ctrace-gen (Schema Merge & Code Generator)
 add_executable(ctrace-gen tools/ctrace-gen/main.cpp)
-if(TARGET nlohmann_json::nlohmann_json)
+target_include_directories(ctrace-gen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools/common)
+if(CTRACE_FORCE_BUILTIN_JSON)
+    target_compile_definitions(ctrace-gen PRIVATE CTRACE_FORCE_BUILTIN_JSON)
+elseif(TARGET nlohmann_json::nlohmann_json)
     target_link_libraries(ctrace-gen PRIVATE nlohmann_json::nlohmann_json)
 endif()
 add_executable(ctrace::ctrace-gen ALIAS ctrace-gen)

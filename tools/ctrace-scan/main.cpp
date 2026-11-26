@@ -22,9 +22,9 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/FileSystem.h>
 
-#include <nlohmann/json.hpp>
+#include "ctrace_json.hpp"
 
-using json = nlohmann::json;
+using json = ctrace::json;
 using namespace clang;
 using namespace clang::tooling;
 
@@ -499,7 +499,10 @@ json fieldInfoToJson(const FieldInfo &f) {
         j["enum_name"] = f.enum_name;
         json constants = json::array();
         for (const auto &c : f.enum_constants) {
-            constants.push_back({{"name", c.name}, {"value", c.value}});
+            json cj = json::object();
+            cj["name"] = c.name;
+            cj["value"] = c.value;
+            constants.push_back(cj);
         }
         j["enum_constants"] = constants;
     } else if (f.type_kind == "struct" || f.type_kind == "counted_array") {

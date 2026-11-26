@@ -9,9 +9,9 @@
 #include <filesystem>
 #include <iomanip>
 
-#include <nlohmann/json.hpp>
+#include "ctrace_json.hpp"
 
-using json = nlohmann::json;
+using json = ctrace::json;
 
 struct EnumConstant {
     std::string name;
@@ -56,7 +56,7 @@ void parseField(const json &jf, Field &f) {
     f.counted_by = jf.value("counted_by", "");
 
     if (jf.contains("enum_name")) {
-        f.enum_name = jf["enum_name"];
+        f.enum_name = jf.value("enum_name", "");
     }
     if (jf.contains("enum_constants") && jf["enum_constants"].is_array()) {
         for (const auto &c : jf["enum_constants"]) {
@@ -64,7 +64,7 @@ void parseField(const json &jf, Field &f) {
         }
     }
     if (jf.contains("struct_name")) {
-        f.struct_name = jf["struct_name"];
+        f.struct_name = jf.value("struct_name", "");
     }
     if (jf.contains("struct_fields") && jf["struct_fields"].is_array()) {
         for (const auto &sub : jf["struct_fields"]) {
@@ -239,7 +239,10 @@ json schemaFieldToJson(const Field &f) {
         j["enum_name"] = f.enum_name;
         json consts = json::array();
         for (const auto &c : f.enum_constants) {
-            consts.push_back({{"name", c.name}, {"value", c.value}});
+            json cj = json::object();
+            cj["name"] = c.name;
+            cj["value"] = c.value;
+            consts.push_back(cj);
         }
         j["constants"] = consts;
     } else if (f.type_kind == "struct" || f.type_kind == "counted_array") {
