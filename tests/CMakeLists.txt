@@ -19,6 +19,13 @@ add_test(NAME test_bin_decode
 )
 set_tests_properties(test_bin_decode PROPERTIES DEPENDS test_bin)
 
+add_test(NAME test_bin_decode_cpp
+    COMMAND $<TARGET_FILE:ctrace-decode>
+            ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_bin/trace_schema.json
+            test_bin.bin
+)
+set_tests_properties(test_bin_decode_cpp PROPERTIES DEPENDS test_bin)
+
 # Test 3: bin-zstd backend (optional)
 if(TARGET ctrace_rt_bin-zstd)
     add_executable(test_zstd test_zstd.c)
@@ -31,6 +38,13 @@ if(TARGET ctrace_rt_bin-zstd)
                 test_zstd.bin.zst
     )
     set_tests_properties(test_zstd_decode PROPERTIES DEPENDS test_zstd)
+
+    add_test(NAME test_zstd_decode_cpp
+        COMMAND $<TARGET_FILE:ctrace-decode>
+                ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_zstd/trace_schema.json
+                test_zstd.bin.zst
+    )
+    set_tests_properties(test_zstd_decode_cpp PROPERTIES DEPENDS test_zstd)
 endif()
 
 # Test 4: sqlite backend (optional)
@@ -84,6 +98,13 @@ add_test(NAME test_writer_thread_decode
 )
 set_tests_properties(test_writer_thread_decode PROPERTIES DEPENDS test_writer_thread)
 
+add_test(NAME test_writer_thread_decode_cpp
+    COMMAND $<TARGET_FILE:ctrace-decode>
+            ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_writer_thread/trace_schema.json
+            test_writer.bin
+)
+set_tests_properties(test_writer_thread_decode_cpp PROPERTIES DEPENDS test_writer_thread)
+
 # Test 10: CPM package manager integration test
 set(CPM_TEST_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/cpm_build")
 add_test(NAME test_cpm_configure
@@ -113,6 +134,14 @@ add_test(NAME test_fapi_verify
 )
 set_tests_properties(test_fapi_verify PROPERTIES DEPENDS test_fapi)
 
+add_test(NAME test_fapi_verify_cpp
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/verify_fapi.py
+            ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_fapi/trace_schema.json
+            test_fapi.bin
+            $<TARGET_FILE:ctrace-decode>
+)
+set_tests_properties(test_fapi_verify_cpp PROPERTIES DEPENDS test_fapi)
+
 # Test 12: Runtime multi-backend selection via CTRACE_BACKEND env var
 add_executable(test_runtime test_runtime.c)
 target_include_directories(test_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -134,3 +163,10 @@ add_test(NAME test_runtime_bin_decode
             test_runtime.bin
 )
 set_tests_properties(test_runtime_bin_decode PROPERTIES DEPENDS test_runtime_bin)
+
+add_test(NAME test_runtime_bin_decode_cpp
+    COMMAND $<TARGET_FILE:ctrace-decode>
+            ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_runtime/trace_schema.json
+            test_runtime.bin
+)
+set_tests_properties(test_runtime_bin_decode_cpp PROPERTIES DEPENDS test_runtime_bin)

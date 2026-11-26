@@ -39,7 +39,10 @@ def main():
     assert "union_cases" in u_fld and len(u_fld["union_cases"]) == 2, f"Expected 2 union cases, got {u_fld.get('union_cases')}"
 
     # 2. Decode binary stream
-    cmd = [sys.executable, decode_tool, schema_path, bin_path]
+    if decode_tool.endswith(".py"):
+        cmd = [sys.executable, decode_tool, schema_path, bin_path]
+    else:
+        cmd = [decode_tool, schema_path, bin_path]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
     out = res.stdout
     print("Decoded output:\n" + out)

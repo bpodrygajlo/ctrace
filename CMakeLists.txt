@@ -96,6 +96,20 @@ elseif(TARGET nlohmann_json::nlohmann_json)
 endif()
 add_executable(ctrace::ctrace-gen ALIAS ctrace-gen)
 
+# Tool 3: ctrace-decode (High-Performance C++ Binary Decoder)
+add_executable(ctrace-decode tools/ctrace-decode/main.cpp)
+target_include_directories(ctrace-decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools/common)
+if(CTRACE_FORCE_BUILTIN_JSON)
+    target_compile_definitions(ctrace-decode PRIVATE CTRACE_FORCE_BUILTIN_JSON)
+elseif(TARGET nlohmann_json::nlohmann_json)
+    target_link_libraries(ctrace-decode PRIVATE nlohmann_json::nlohmann_json)
+endif()
+if(CTRACE_HAVE_ZSTD)
+    target_compile_definitions(ctrace-decode PRIVATE CTRACE_HAVE_ZSTD)
+    target_link_libraries(ctrace-decode PRIVATE ${ZSTD_LIB})
+endif()
+add_executable(ctrace::ctrace-decode ALIAS ctrace-decode)
+
 # Runtime libraries
 # 1. ctrace_rt_stdout (Pure C / POSIX, no external dependencies)
 add_library(ctrace_rt_stdout STATIC runtime/rt_common.c)
@@ -161,7 +175,7 @@ include(cmake/ctrace.cmake)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-install(TARGETS ctrace-scan ctrace-gen
+install(TARGETS ctrace-scan ctrace-gen ctrace-decode
     EXPORT ctraceTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
