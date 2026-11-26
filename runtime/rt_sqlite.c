@@ -94,7 +94,11 @@ void ctrace_init(const char *target_uri) {
 
     const char *db_path = target_uri;
     if (!db_path || strcmp(db_path, "") == 0) {
-        db_path = ":memory:";
+        db_path = "trace.db";
+    }
+
+    if (strcmp(db_path, ":memory:") != 0) {
+        unlink(db_path);
     }
 
     int rc = sqlite3_open_v2(db_path, &g_db,
@@ -111,12 +115,13 @@ void ctrace_init(const char *target_uri) {
         return;
     }
 
-    // Set performance PRAGMAs
-    sqlite3_exec(g_db, "PRAGMA journal_mode=MEMORY;", NULL, NULL, NULL);
+    // Write-only trace capture PRAGMAs for high-throughput disk persistence
     sqlite3_exec(g_db, "PRAGMA synchronous=OFF;", NULL, NULL, NULL);
+    sqlite3_exec(g_db, "PRAGMA journal_mode=MEMORY;", NULL, NULL, NULL);
+    sqlite3_exec(g_db, "PRAGMA locking_mode=EXCLUSIVE;", NULL, NULL, NULL);
     sqlite3_exec(g_db, "PRAGMA temp_store=MEMORY;", NULL, NULL, NULL);
 
-    // Initialize tables and statements
+    // Initialize tables and prepared statements
     if (g_sqlite_init_fn) {
         g_sqlite_init_fn(g_db);
     } else if (__ctrace_sqlite_init_events) {
@@ -145,82 +150,4 @@ void ctrace_shutdown(void) {
     pthread_mutex_lock(&g_sqlite_mutex);
     close_sqlite_db_locked();
     pthread_mutex_unlock(&g_sqlite_mutex);
-}
-
-int ctrace_sql_exec(const char *sql, int (*cb)(void*, int, char**, char**), void *arg) {
-    pthread_mutex_lock(&g_sqlite_mutex);
-    if (!g_db) {
-        pthread_mutex_unlock(&g_sqlite_mutex);
-        return SQLITE_ERROR;
-    }
-    // Flush active transaction so readers can see the latest writes
-    if (g_in_transaction) {
-        sqlite3_exec(g_db, "COMMIT; BEGIN TRANSACTION;", NULL, NULL, NULL);
-        g_batch_count = 0;
-        clock_gettime(CLOCK_MONOTONIC, &g_last_commit_ts);
-    }
-
-    char *errmsg = NULL;
-    int rc = sqlite3_exec(g_db, sql, cb, arg, &errmsg);
-    if (errmsg) {
-        sqlite3_free(errmsg);
-    }
-    pthread_mutex_unlock(&g_sqlite_mutex);
-    return rc;
-}
-
-int ctrace_sql_snapshot(const char *dest_path) {
-    if (!dest_path) return SQLITE_MISUSE;
-
-    pthread_mutex_lock(&g_sqlite_mutex);
-    if (!g_db) {
-        pthread_mutex_unlock(&g_sqlite_mutex);
-        return SQLITE_ERROR;
-    }
-
-    // VACUUM cannot be run inside a transaction in SQLite. Commit first.
-    if (g_in_transaction) {
-        sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL);
-        g_in_transaction = 0;
-    }
-
-    // Vacuum into a temporary path first so an existing snapshot is never lost on error
-    size_t dlen = strlen(dest_path);
-    char *tmp_path = (char *)malloc(dlen + 16);
-    if (!tmp_path) {
-        sqlite3_exec(g_db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
-        g_in_transaction = 1;
-        pthread_mutex_unlock(&g_sqlite_mutex);
-        return SQLITE_NOMEM;
-    }
-    snprintf(tmp_path, dlen + 16, "%s.tmp.%d", dest_path, (int)getpid());
-    unlink(tmp_path);
-
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(g_db, "VACUUM INTO ?;", -1, &stmt, NULL);
-    int step_rc = SQLITE_ERROR;
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, tmp_path, -1, SQLITE_STATIC);
-        step_rc = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-    }
-
-    if (step_rc == SQLITE_DONE) {
-        if (rename(tmp_path, dest_path) != 0) {
-            unlink(tmp_path);
-            step_rc = SQLITE_IOERR;
-        }
-    } else {
-        unlink(tmp_path);
-    }
-    free(tmp_path);
-
-    // Resume batching transaction
-    sqlite3_exec(g_db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
-    g_in_transaction = 1;
-    g_batch_count = 0;
-    clock_gettime(CLOCK_MONOTONIC, &g_last_commit_ts);
-
-    pthread_mutex_unlock(&g_sqlite_mutex);
-    return (step_rc == SQLITE_DONE) ? SQLITE_OK : step_rc;
 }

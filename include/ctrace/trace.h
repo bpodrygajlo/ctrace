@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-void ctrace_init(const char *target_uri); // e.g., NULL (stdout), "trace.bin", or ":memory:"
+void ctrace_init(const char *target_uri); // e.g., NULL (stdout), "trace.bin", "trace.db", or "trace_ctf"
 void ctrace_flush(void);
 void ctrace_shutdown(void);
 
@@ -38,11 +38,6 @@ uint64_t ctrace_now_ns(void);
 uint64_t ctrace_get_tsc_freq(void);
 uint64_t ctrace_cycles_to_ns(uint64_t cycles);
 void ctrace_calibrate_tsc(void);
-
-#if defined(CTRACE_BACKEND_SQLITE) || defined(CTRACE_ENABLE_SQL_API)
-int ctrace_sql_exec(const char *sql, int (*cb)(void*, int, char**, char**), void *arg);
-int ctrace_sql_snapshot(const char *dest_path); // Wraps VACUUM INTO
-#endif
 
 #ifdef CTRACE_AST_SCAN
 void __ctrace_hook(const char *event_name, ...);

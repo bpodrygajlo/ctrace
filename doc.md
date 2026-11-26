@@ -120,16 +120,15 @@ For each argument `Expr` passed to `__ctrace_hook`:
 * **Compression:** When a 64 KB chunk fills (or `ctrace_flush()` is called), `ZSTD_compressCCtx()` compresses the chunk using a reusable thread-local `ZSTD_CCtx` and writes a framed block `[ uint32_t compressed_len ][ zstd_frame ]` to the output stream.
 * **Benefit:** Amortizes Zstd frame headers across hundreds of events while keeping individual `TRACE_EVENT` calls in the ~30–80 ns range.
 
-### 4.4 `sqlite` (In-Memory Database) Backend
-* **Initialization (`ctrace_init(":memory:")`):**
-  * Opens an in-memory database with `PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;`.
+### 4.4 `sqlite` (Direct-to-File SQLite Database) Backend
+* **Initialization (`ctrace_init("trace.db")`):**
+  * Creates a fresh SQLite database file (defaults to `"trace.db"` when `NULL` or `""` is passed) with write-optimized settings: `PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY; PRAGMA locking_mode=EXCLUSIVE; PRAGMA temp_store=MEMORY;`.
   * Executes generated `CREATE TABLE` DDL for every discovered event (e.g., `ctrace_<event_name>`).
   * Pre-compiles one `sqlite3_stmt *` per event (`INSERT INTO ctrace_<name> VALUES (?, ?, ...)`).
 * **Hot-Path Execution:**
   * Calls `sqlite3_bind_*` directly for each argument, executes `sqlite3_step()`, and calls `sqlite3_reset()`.
   * **Transaction Batching:** Wraps inserts in an open transaction that commits automatically every $N$ events (default `1000`) or $T$ milliseconds (default `10 ms`) to eliminate per-event commit overhead.
-  * **Thread Safety:** Protected by a lightweight mutex (or fed asynchronously from the lock-free ring buffer when `-DCTRACE_SQLITE_ASYNC=ON` is enabled).
-* **Post-Mortem Dump:** `ctrace_sql_snapshot("crash_trace.db")` executes `VACUUM INTO ?` to atomically serialize the `:memory:` database to disk.
+  * **Post-Run SQL Investigation:** On `ctrace_shutdown()`, commits the final transaction, finalizes all prepared statements, and closes the database so users can query the resulting `.db` file directly with the `sqlite3` CLI or any SQL client.
 
 ### 4.5 `ctf` (Common Trace Format v1.8) Backend
 * **Standard Compliance:** Emits 100% compliant CTF 1.8 packets directly readable by standard tools (`babeltrace2`, `babeltrace`, Eclipse Trace Compass).

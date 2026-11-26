@@ -23,7 +23,7 @@ Behind the scenes, a standalone Clang `LibTooling` compiler pass inspects the AS
   * **`stdout`**: Thread-safe (`flockfile`) line-delimited logging with monotonic timestamps.
   * **`bin`**: Packed little-endian binary stream powered by a lock-free per-thread SPSC circular ring buffer (256 KB) and background writer thread.
   * **`bin-zstd`**: Chunked 64 KB Zstandard-compressed binary stream with amortized frame headers.
-  * **`sqlite`**: In-memory (`:memory:`) SQLite database with memory PRAGMAs, automatic DDL creation, transaction batching, query interface (`ctrace_sql_exec`), and atomic `VACUUM INTO` crash dumps (`ctrace_sql_snapshot`).
+  * **`sqlite`**: Direct-to-file SQLite database backend (`trace.db`) with write-optimized PRAGMAs (`synchronous=OFF`, `locking_mode=EXCLUSIVE`, `journal_mode=MEMORY`), automatic per-event DDL table creation, and transaction batching for post-run SQL analysis.
   * **`ctf`**: Common Trace Format (CTF 1.8) stream with auto-generated TSDL metadata, directly readable by **`babeltrace2`**, **`babeltrace`**, and **Eclipse Trace Compass**.
 * **Cross-TU Validation:** Incremental per-file AST sidecar extraction with cross-translation-unit signature validation (aborts on type/arity mismatches with exact file and line diagnostics).
 
@@ -176,11 +176,12 @@ cmake --build build
 babeltrace2 trace_ctf
 ```
 
-Switch to **In-Memory SQLite** (optional, requires SQLite3):
+Switch to **SQLite Database** (optional, requires SQLite3):
 ```bash
 cmake -B build -S . -DCTRACE_BACKEND=sqlite
 cmake --build build
 ./build/my_service
+sqlite3 trace.db "SELECT * FROM ctrace_net_rx LIMIT 10;"
 ```
 
 Switch to **Zstandard-Compressed Binary** (optional, requires Zstandard):
@@ -283,13 +284,6 @@ TRACE_EVENT(wire_frame, frame);
 
 > [!NOTE]
 > **Thread Naming & Real-Time Guard:** The background thread is automatically named `"ctrace-writer"` (visible in `top`, `htop`, `ps -T`). If `ctrace_init()` is called from a real-time thread (`SCHED_FIFO` / `SCHED_RR`), `ctrace` automatically decouples the writer to standard `SCHED_OTHER` so it never pollutes the real-time scheduling class.
-
-### SQLite Backend APIs (`-DCTRACE_BACKEND=sqlite`)
-
-| Function | Description |
-| :--- | :--- |
-| `int ctrace_sql_exec(sql, cb, arg)` | Executes an arbitrary SQL query on the active trace database. |
-| `int ctrace_sql_snapshot(dest_path)` | Atomically serializes the `:memory:` database to disk via `VACUUM INTO ?`. |
 
 ---
 

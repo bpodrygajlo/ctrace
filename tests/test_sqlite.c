@@ -4,18 +4,22 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
+#include <sqlite3.h>
 
-static int g_query_row_count = 0;
-static int count_cb(void *arg, int argc, char **argv, char **colNames) {
-    (void)arg; (void)colNames;
-    if (argc > 0 && argv[0]) {
-        g_query_row_count = atoi(argv[0]);
-    }
-    return 0;
+static int query_count(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(stmt);
+    assert(rc == SQLITE_ROW);
+    int count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
 }
 
 int main(void) {
-    ctrace_init(":memory:");
+    // Run 1: Write trace directly to a SQLite database file
+    ctrace_init("test_sqlite.db");
 
     int socket_fd = 77;
     size_t len = 512;
@@ -31,39 +35,25 @@ int main(void) {
     TRACE_EVENT(api_call, url, lvl, active);
 
     ctrace_flush();
-
-    // Query in-memory DB
-    int rc = ctrace_sql_exec("SELECT COUNT(*) FROM ctrace_net_rx;", count_cb, NULL);
-    assert(rc == 0);
-    assert(g_query_row_count == 25);
-
-    rc = ctrace_sql_exec("SELECT COUNT(*) FROM ctrace_api_call;", count_cb, NULL);
-    assert(rc == 0);
-    assert(g_query_row_count == 1);
-
-    // Test snapshot
-    rc = ctrace_sql_snapshot("test_sqlite_snapshot.db");
-    assert(rc == 0);
-
     ctrace_shutdown();
 
-    // Verify snapshot file exists and is non-empty
-    FILE *f = fopen("test_sqlite_snapshot.db", "rb");
-    assert(f != NULL);
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fclose(f);
-    assert(size > 0);
+    // Offline investigation: open the saved SQLite file directly with sqlite3
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2("test_sqlite.db", &db, SQLITE_OPEN_READONLY, NULL);
+    assert(rc == SQLITE_OK && db != NULL);
+    assert(query_count(db, "SELECT COUNT(*) FROM ctrace_net_rx;") == 25);
+    assert(query_count(db, "SELECT COUNT(*) FROM ctrace_api_call WHERE url = 'http://api.local/query' AND active = 1;") == 1);
+    sqlite3_close(db);
 
-    // Test re-initialization after shutdown (verifying statement finalization & reset)
-    ctrace_init(":memory:");
+    // Run 2: Verify re-initialization overwrites cleanly with fresh run results
+    ctrace_init("test_sqlite.db");
     TRACE_EVENT(net_rx, socket_fd, len, payload);
-    ctrace_flush();
-    g_query_row_count = 0;
-    rc = ctrace_sql_exec("SELECT COUNT(*) FROM ctrace_net_rx;", count_cb, NULL);
-    assert(rc == 0);
-    assert(g_query_row_count == 1);
     ctrace_shutdown();
+
+    rc = sqlite3_open_v2("test_sqlite.db", &db, SQLITE_OPEN_READONLY, NULL);
+    assert(rc == SQLITE_OK && db != NULL);
+    assert(query_count(db, "SELECT COUNT(*) FROM ctrace_net_rx;") == 1);
+    sqlite3_close(db);
 
     printf("test_sqlite passed successfully!\n");
     return 0;
