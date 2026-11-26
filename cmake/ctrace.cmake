@@ -9,10 +9,14 @@ endif()
 
 if(NOT DEFINED CTRACE_INCLUDE_DIR OR "${CTRACE_INCLUDE_DIR}" STREQUAL "")
     if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../include/ctrace/trace.h")
-        get_filename_component(CTRACE_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../include" ABSOLUTE)
+        get_filename_component(_CTRACE_INC "${CMAKE_CURRENT_LIST_DIR}/../include" ABSOLUTE)
+        set(CTRACE_INCLUDE_DIR "${_CTRACE_INC}" CACHE INTERNAL "Path to ctrace public include directory" FORCE)
     elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../include/ctrace/trace.h")
-        get_filename_component(CTRACE_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../include" ABSOLUTE)
+        get_filename_component(_CTRACE_INC "${CMAKE_CURRENT_LIST_DIR}/../../../include" ABSOLUTE)
+        set(CTRACE_INCLUDE_DIR "${_CTRACE_INC}" CACHE INTERNAL "Path to ctrace public include directory" FORCE)
     endif()
+else()
+    set(CTRACE_INCLUDE_DIR "${CTRACE_INCLUDE_DIR}" CACHE INTERNAL "Path to ctrace public include directory" FORCE)
 endif()
 
 # Ensure compile_commands.json is a valid JSON array so Clang doesn't error on empty file
@@ -83,7 +87,7 @@ function(target_enable_ctrace TARGET_NAME)
                         --extra-arg=-I${CTRACE_INCLUDE_DIR}
                         -o "${SIDECAR}"
                         "${SRC_ABS}"
-                DEPENDS "${SRC_ABS}" ${CTRACE_SCAN_TARGET} "${CMAKE_BINARY_DIR}/compile_commands.json"
+                DEPENDS "${SRC_ABS}" ${CTRACE_SCAN_TARGET}
                 COMMENT "[ctrace] Scanning AST for ${SRC_NAME}"
                 VERBATIM
             )

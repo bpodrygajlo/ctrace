@@ -99,3 +99,38 @@ add_test(NAME test_cpm_run
     WORKING_DIRECTORY ${CPM_TEST_BUILD_DIR}
 )
 set_tests_properties(test_cpm_run PROPERTIES DEPENDS test_cpm_build)
+
+# Test 11: FAPI unions, fixed arrays, and dynamic count binding
+add_executable(test_fapi test_fapi.c)
+target_include_directories(test_fapi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_enable_ctrace(test_fapi BACKEND bin)
+add_test(NAME test_fapi COMMAND test_fapi)
+add_test(NAME test_fapi_verify
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/verify_fapi.py
+            ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_fapi/trace_schema.json
+            test_fapi.bin
+            ${PROJECT_SOURCE_DIR}/tools/ctrace_decode.py
+)
+set_tests_properties(test_fapi_verify PROPERTIES DEPENDS test_fapi)
+
+# Test 12: Runtime multi-backend selection via CTRACE_BACKEND env var
+add_executable(test_runtime test_runtime.c)
+target_include_directories(test_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_enable_ctrace(test_runtime BACKEND runtime)
+
+add_test(NAME test_runtime_stdout COMMAND test_runtime)
+set_tests_properties(test_runtime_stdout PROPERTIES
+    ENVIRONMENT "CTRACE_BACKEND=stdout"
+)
+
+add_test(NAME test_runtime_bin COMMAND test_runtime)
+set_tests_properties(test_runtime_bin PROPERTIES
+    ENVIRONMENT "CTRACE_BACKEND=bin;CTRACE_OUTPUT_PATH=test_runtime.bin"
+)
+
+add_test(NAME test_runtime_bin_decode
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/ctrace_decode.py
+            ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_runtime/trace_schema.json
+            test_runtime.bin
+)
+set_tests_properties(test_runtime_bin_decode PROPERTIES DEPENDS test_runtime_bin)

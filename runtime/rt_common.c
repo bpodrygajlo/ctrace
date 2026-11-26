@@ -8,7 +8,9 @@
 #include <stdatomic.h>
 
 static FILE *g_ctrace_out = NULL;
+#ifndef CTRACE_BACKEND_CUSTOM
 static int g_ctrace_owns_file = 0;
+#endif
 static pthread_mutex_t g_stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t g_tsc_freq = 2000000000ULL;
@@ -113,7 +115,12 @@ void ctrace_stdout_release(FILE *f) {
 
 #ifndef CTRACE_BACKEND_CUSTOM
 // Default implementation of lifecycle for stdout backend
-void ctrace_init(const char *target_uri) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_init_stdout(const char *target_uri)
+#else
+void ctrace_init(const char *target_uri)
+#endif
+{
     ctrace_calibrate_tsc();
 
     pthread_mutex_lock(&g_stdout_mutex);
@@ -123,19 +130,27 @@ void ctrace_init(const char *target_uri) {
         g_ctrace_owns_file = 0;
     }
 
-    if (!target_uri || strcmp(target_uri, "stdout") == 0 || strcmp(target_uri, "") == 0) {
+    const char *path = target_uri;
+    if (!path || strcmp(path, "") == 0) {
+        path = getenv("CTRACE_OUTPUT_PATH");
+        if (!path || strcmp(path, "") == 0) {
+            path = getenv("CTRACE_FILE");
+        }
+    }
+
+    if (!path || strcmp(path, "stdout") == 0 || strcmp(path, "") == 0) {
         g_ctrace_out = stdout;
         g_ctrace_owns_file = 0;
-    } else if (strcmp(target_uri, "stderr") == 0) {
+    } else if (strcmp(path, "stderr") == 0) {
         g_ctrace_out = stderr;
         g_ctrace_owns_file = 0;
     } else {
-        FILE *f = fopen(target_uri, "w");
+        FILE *f = fopen(path, "w");
         if (f) {
             g_ctrace_out = f;
             g_ctrace_owns_file = 1;
         } else {
-            fprintf(stderr, "ctrace warning: Failed to open '%s', falling back to stdout\n", target_uri);
+            fprintf(stderr, "ctrace warning: Failed to open '%s', falling back to stdout\n", path);
             g_ctrace_out = stdout;
             g_ctrace_owns_file = 0;
         }
@@ -143,7 +158,12 @@ void ctrace_init(const char *target_uri) {
     pthread_mutex_unlock(&g_stdout_mutex);
 }
 
-void ctrace_flush(void) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_flush_stdout(void)
+#else
+void ctrace_flush(void)
+#endif
+{
     pthread_mutex_lock(&g_stdout_mutex);
     if (g_ctrace_out) {
         flockfile(g_ctrace_out);
@@ -153,7 +173,12 @@ void ctrace_flush(void) {
     pthread_mutex_unlock(&g_stdout_mutex);
 }
 
-void ctrace_shutdown(void) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_shutdown_stdout(void)
+#else
+void ctrace_shutdown(void)
+#endif
+{
     pthread_mutex_lock(&g_stdout_mutex);
     if (g_ctrace_out) {
         flockfile(g_ctrace_out);

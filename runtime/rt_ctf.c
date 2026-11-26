@@ -10,6 +10,10 @@
 #include <stdatomic.h>
 #include <errno.h>
 
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_shutdown_ctf(void);
+#endif
+
 #define CTF_MAGIC 0xC1FC1FC1
 #define CTF_PACKET_SIZE 65536 // 64 KB
 
@@ -176,13 +180,28 @@ void ctrace_ctf_commit(void *ptr, size_t len) {
     pthread_mutex_unlock(&t->lock);
 }
 
-void ctrace_init(const char *target_uri) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_init_ctf(const char *target_uri)
+#else
+void ctrace_init(const char *target_uri)
+#endif
+{
     ctrace_calibrate_tsc();
     if (atomic_load_explicit(&g_ctf_fd, memory_order_acquire) >= 0) {
+#if defined(CTRACE_MULTI_BACKEND)
+        ctrace_shutdown_ctf();
+#else
         ctrace_shutdown();
+#endif
     }
 
     const char *dir_path = target_uri;
+    if (!dir_path || strcmp(dir_path, "") == 0) {
+        dir_path = getenv("CTRACE_OUTPUT_PATH");
+        if (!dir_path || strcmp(dir_path, "") == 0) {
+            dir_path = getenv("CTRACE_FILE");
+        }
+    }
     if (!dir_path || strcmp(dir_path, "") == 0) {
         dir_path = "trace_ctf";
     }
@@ -210,7 +229,12 @@ void ctrace_init(const char *target_uri) {
     atomic_store_explicit(&g_ctf_fd, fd, memory_order_release);
 }
 
-void ctrace_flush(void) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_flush_ctf(void)
+#else
+void ctrace_flush(void)
+#endif
+{
     ctrace_ctf_thread_t *curr = atomic_load_explicit(&g_ctf_threads, memory_order_acquire);
     while (curr) {
         pthread_mutex_lock(&curr->lock);
@@ -227,8 +251,17 @@ void ctrace_flush(void) {
     pthread_mutex_unlock(&g_ctf_file_mutex);
 }
 
-void ctrace_shutdown(void) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_shutdown_ctf(void)
+#else
+void ctrace_shutdown(void)
+#endif
+{
+#if defined(CTRACE_MULTI_BACKEND)
+    ctrace_flush_ctf();
+#else
     ctrace_flush();
+#endif
 
     pthread_mutex_lock(&g_ctf_file_mutex);
     int fd = atomic_load_explicit(&g_ctf_fd, memory_order_acquire);

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <iomanip>
+#include <cinttypes>
 
 #include "ctrace_json.hpp"
 
@@ -28,6 +29,8 @@ struct Field {
     int array_index = -1;
     std::string array_parent;
     std::string counted_by;
+    uint64_t array_len = 0;
+    std::string tag_field;
 
     std::string enum_name;
     std::vector<EnumConstant> enum_constants;
@@ -54,6 +57,8 @@ void parseField(const json &jf, Field &f) {
     f.array_index = jf.value("array_index", -1);
     f.array_parent = jf.value("array_parent", "");
     f.counted_by = jf.value("counted_by", "");
+    f.array_len = jf.value("array_len", 0ULL);
+    f.tag_field = jf.value("tag_field", "");
 
     if (jf.contains("enum_name")) {
         f.enum_name = jf.value("enum_name", "");
@@ -68,6 +73,13 @@ void parseField(const json &jf, Field &f) {
     }
     if (jf.contains("struct_fields") && jf["struct_fields"].is_array()) {
         for (const auto &sub : jf["struct_fields"]) {
+            Field sf;
+            parseField(sub, sf);
+            f.struct_fields.push_back(sf);
+        }
+    }
+    if (jf.contains("union_cases") && jf["union_cases"].is_array()) {
+        for (const auto &sub : jf["union_cases"]) {
             Field sf;
             parseField(sub, sf);
             f.struct_fields.push_back(sf);
@@ -112,6 +124,8 @@ struct FlatField {
     std::string enum_name;
     std::vector<EnumConstant> enum_constants;
     std::string counted_by;
+    uint64_t array_len = 0;
+    std::string tag_field;
     uint64_t elem_size = 0;
     std::vector<Field> struct_fields;
 };
@@ -153,6 +167,8 @@ void flattenFieldInternal(const Field &f, const std::string &prefix, const std::
         ff.enum_name = f.enum_name;
         ff.enum_constants = f.enum_constants;
         ff.counted_by = f.counted_by;
+        ff.array_len = f.array_len;
+        ff.tag_field = f.tag_field;
         ff.struct_fields = f.struct_fields;
         if (!f.struct_fields.empty()) {
             ff.elem_size = f.struct_fields[0].size;
@@ -192,7 +208,7 @@ std::vector<FlatField> flattenEventFields(const std::vector<Field> &fields, bool
 
 bool eventHasStructArgs(const Event &ev) {
     for (const auto &f : ev.fields) {
-        if (f.type_kind == "struct" || f.type_kind == "counted_array") {
+        if (f.type_kind == "struct" || f.type_kind == "counted_array" || f.type_kind == "fixed_array" || f.type_kind == "union") {
             return true;
         }
     }
@@ -217,7 +233,7 @@ std::string safeParamCType(const Field &f) {
 
 std::string sqliteColumnType(const std::string &type_kind) {
     if (type_kind == "string") return "TEXT";
-    if (type_kind == "bytes" || type_kind == "counted_array") return "BLOB";
+    if (type_kind == "bytes" || type_kind == "counted_array" || type_kind == "fixed_array" || type_kind == "union") return "BLOB";
     if (type_kind == "float" || type_kind == "double") return "REAL";
     return "INTEGER"; // int, uint, bool, enum
 }
@@ -252,6 +268,20 @@ json schemaFieldToJson(const Field &f) {
             subs.push_back(schemaFieldToJson(sub));
         }
         j["fields"] = subs;
+    } else if (f.type_kind == "fixed_array") {
+        j["array_len"] = f.array_len;
+        json subs = json::array();
+        for (const auto &sub : f.struct_fields) {
+            subs.push_back(schemaFieldToJson(sub));
+        }
+        j["fields"] = subs;
+    } else if (f.type_kind == "union") {
+        j["tag_field"] = f.tag_field;
+        json cases = json::array();
+        for (const auto &sub : f.struct_fields) {
+            cases.push_back(schemaFieldToJson(sub));
+        }
+        j["union_cases"] = cases;
     }
     return j;
 }
@@ -332,6 +362,8 @@ std::string generateCtfTsdl(const std::map<std::string, Event> &events) {
             } else if (ff.type_kind == "bytes" || ff.type_kind == "counted_array") {
                 m << "        uint32_t " << ff.flat_name << "_len;\n";
                 m << "        uint8_t " << ff.flat_name << "[" << ff.flat_name << "_len];\n";
+            } else if (ff.type_kind == "fixed_array" || ff.type_kind == "union") {
+                m << "        uint8_t " << ff.flat_name << "[" << ff.size << "];\n";
             } else if (ff.type_kind == "bool") {
                 m << "        uint8_t " << ff.flat_name << ";\n";
             } else if (ff.type_kind == "enum") {
@@ -507,8 +539,8 @@ int main(int argc, char **argv) {
         stripQuotes(sf);
     }
 
-    if (backend != "stdout" && backend != "bin" && backend != "bin-zstd" && backend != "sqlite" && backend != "ctf") {
-        std::cerr << "ctrace-gen error: Unknown backend '" << backend << "'. Valid backends: stdout, bin, bin-zstd, sqlite, ctf\n";
+    if (backend != "stdout" && backend != "bin" && backend != "bin-zstd" && backend != "sqlite" && backend != "ctf" && backend != "runtime" && backend != "multi") {
+        std::cerr << "ctrace-gen error: Unknown backend '" << backend << "'. Valid backends: stdout, bin, bin-zstd, sqlite, ctf, runtime\n";
         return 1;
     }
 
@@ -672,9 +704,9 @@ int main(int argc, char **argv) {
     h << "uint64_t ctrace_now_ns(void);\n\n";
 
     // Helper to emit function or macro header & argument bindings
-    auto emitEmitterHeader = [&](const Event &ev, bool isMacro, const std::string &eol) {
+    auto emitEmitterHeader = [&](const Event &ev, bool isMacro, const std::string &eol, const std::string &fnPrefix) {
         if (isMacro) {
-            h << "#define __ctrace_emit_" << ev.name << "(";
+            h << "#define " << fnPrefix << ev.name << "(";
             for (size_t i = 0; i < ev.fields.size(); ++i) {
                 if (i > 0) h << ", ";
                 h << "_ctrace_a" << i;
@@ -688,7 +720,7 @@ int main(int argc, char **argv) {
                 }
             }
         } else {
-            h << "static inline void __ctrace_emit_" << ev.name << "(";
+            h << "static inline void " << fnPrefix << ev.name << "(";
             if (ev.fields.empty()) {
                 h << "void";
             } else {
@@ -719,31 +751,26 @@ int main(int argc, char **argv) {
         }
     };
 
-    if (backend == "stdout") {
-        h << "#include <stdio.h>\n\n";
-        h << "FILE *ctrace_get_stdout_file(void);\n";
-        h << "FILE *ctrace_stdout_acquire(void);\n";
-        h << "void ctrace_stdout_release(FILE *f);\n\n";
-
-        // Generate enum string helper functions recursively
-        std::map<std::string, std::vector<EnumConstant>> allEnums;
-        auto collectEnums = [&](auto &self, const std::vector<Field> &flds) -> void {
-            for (const auto &f : flds) {
-                if (f.type_kind == "enum" && !f.enum_name.empty()) {
-                    if (allEnums.find(f.enum_name) == allEnums.end() || (!f.enum_constants.empty() && allEnums[f.enum_name].empty())) {
-                        allEnums[f.enum_name] = f.enum_constants;
-                    }
-                }
-                if (!f.struct_fields.empty()) {
-                    self(self, f.struct_fields);
+    // Generate enum string helper functions recursively
+    std::map<std::string, std::vector<EnumConstant>> allEnums;
+    auto collectEnums = [&](auto &self, const std::vector<Field> &flds) -> void {
+        for (const auto &f : flds) {
+            if (f.type_kind == "enum" && !f.enum_name.empty()) {
+                if (allEnums.find(f.enum_name) == allEnums.end() || (!f.enum_constants.empty() && allEnums[f.enum_name].empty())) {
+                    allEnums[f.enum_name] = f.enum_constants;
                 }
             }
-        };
-
-        for (const auto &pair : events) {
-            collectEnums(collectEnums, pair.second.fields);
+            if (!f.struct_fields.empty()) {
+                self(self, f.struct_fields);
+            }
         }
+    };
 
+    for (const auto &pair : events) {
+        collectEnums(collectEnums, pair.second.fields);
+    }
+
+    auto emitEnumHelpers = [&]() {
         for (const auto &ep : allEnums) {
             h << "static inline const char *__ctrace_enum_" << ep.first << "_to_str(int64_t val) {\n";
             h << "    switch (val) {\n";
@@ -758,175 +785,385 @@ int main(int argc, char **argv) {
             h << "    }\n";
             h << "}\n\n";
         }
+    };
 
-        // Helper for printing structured fields in stdout
-        auto generateStdoutFieldPrinter = [&](auto &self, const Field &f, const std::string &accessor, bool isTopLevel, bool inArray, int loopDepth, const std::string &eol) -> void {
-            std::string prefix = isTopLevel ? " " : "";
-            std::string namePrefix = inArray ? "" : (prefix + f.name + "=");
-            if (f.type_kind == "counted_array") {
-                std::string cnt = getCountExpr(accessor, f.counted_by);
-                std::string lvar = "_i" + std::to_string(loopDepth);
-                std::string cvar = "_cnt" + std::to_string(loopDepth);
-                h << "    {" << eol;
-                if (f.is_pointer) {
-                    h << "    size_t " << cvar << " = (((int64_t)(" << cnt << ") > 0) && ((const void *)(" << accessor << ") != NULL)) ? (size_t)(" << cnt << ") : 0;" << eol;
-                } else {
-                    h << "    size_t " << cvar << " = ((int64_t)(" << cnt << ") > 0) ? (size_t)(" << cnt << ") : 0;" << eol;
-                }
-                h << "    fprintf(_f, \"" << prefix << f.name << "=[\");" << eol;
-                h << "    for (size_t " << lvar << " = 0; " << lvar << " < " << cvar << "; ++" << lvar << ") {" << eol;
-                h << "        if (" << lvar << " > 0) fprintf(_f, \", \");" << eol;
-                std::string elemAccessor = "(" + accessor + ")[" + lvar + "]";
-                if (!f.struct_fields.empty()) {
-                    const auto &elem = f.struct_fields[0];
-                    self(self, elem, elemAccessor, false, true, loopDepth + 1, eol);
-                }
-                h << "    }" << eol;
-                h << "    fprintf(_f, \"]\");" << eol;
-                h << "    }" << eol;
-            } else if (f.type_kind == "struct") {
-                std::string op = f.is_pointer ? "->" : ".";
-                if (f.is_pointer) {
-                    h << "    if (!(" << accessor << ")) {" << eol;
-                    h << "        fprintf(_f, \"" << (inArray ? "(null)" : (prefix + f.name + "=(null)")) << "\");" << eol;
-                    h << "    } else {" << eol;
-                }
-                h << "    fprintf(_f, \"" << (inArray ? "{" : (prefix + f.name + "={")) << "\");" << eol;
-                for (size_t i = 0; i < f.struct_fields.size(); ++i) {
-                    const auto &sub = f.struct_fields[i];
-                    std::string subAccessor;
-                    if (sub.array_index >= 0) {
-                        subAccessor = "(" + accessor + ")" + op + sub.array_parent + "[" + std::to_string(sub.array_index) + "]";
-                    } else {
-                        subAccessor = "(" + accessor + ")" + op + sub.name;
-                    }
-                    if (i > 0) {
-                        h << "    fprintf(_f, \", \");" << eol;
-                    }
-                    self(self, sub, subAccessor, false, false, loopDepth, eol);
-                }
-                h << "    fprintf(_f, \"}\");" << eol;
-                if (f.is_pointer) {
-                    h << "    }" << eol;
-                }
-            } else if (f.type_kind == "string") {
-                if (!f.is_pointer && f.size > 0) {
-                    h << "    fprintf(_f, \"" << namePrefix << "\\\"%.*s\\\"\", (int)" << f.size << ", " << accessor << ");" << eol;
-                } else {
-                    h << "    fprintf(_f, \"" << namePrefix << "\\\"%s\\\"\", (" << accessor << ") ? (" << accessor << ") : \"(null)\");" << eol;
-                }
-            } else if (f.type_kind == "bytes") {
-                h << "    fprintf(_f, \"" << namePrefix << "[len=%zu,hex=\", (size_t)(" << accessor << ").len);" << eol;
-                h << "    if ((" << accessor << ").ptr) {" << eol;
-                h << "        for (size_t _i = 0; _i < (" << accessor << ").len && _i < 16; ++_i) {" << eol;
-                h << "            fprintf(_f, \"%02x\", ((const unsigned char *)(" << accessor << ").ptr)[_i]);" << eol;
-                h << "        }" << eol;
-                h << "        if ((" << accessor << ").len > 16) fprintf(_f, \"...\");" << eol;
-                h << "    }" << eol;
-                h << "    fprintf(_f, \"]\");" << eol;
-            } else if (f.type_kind == "bool") {
-                h << "    fprintf(_f, \"" << namePrefix << "%s\", (" << accessor << ") ? \"true\" : \"false\");" << eol;
-            } else if (f.type_kind == "enum") {
-                if (!f.enum_name.empty()) {
-                    h << "    fprintf(_f, \"" << namePrefix << "%s\", __ctrace_enum_" << f.enum_name << "_to_str((int64_t)(" << accessor << ")));" << eol;
-                } else {
-                    h << "    fprintf(_f, \"" << namePrefix << "%\" PRId64, (int64_t)(" << accessor << "));" << eol;
-                }
-            } else if (f.type_kind == "float" || f.type_kind == "double") {
-                h << "    fprintf(_f, \"" << namePrefix << "%.6g\", (double)(" << accessor << "));" << eol;
-            } else if (f.is_pointer) {
-                h << "    fprintf(_f, \"" << namePrefix << "%\" PRIu64, (uint64_t)(uintptr_t)(" << accessor << "));" << eol;
+    if (backend == "stdout" || backend == "runtime" || backend == "multi") {
+        h << "#include <stdio.h>\n";
+        h << "#include <stdarg.h>\n\n";
+        h << "static inline void __ctrace_buf_append(char **p, size_t *rem, const char *fmt, ...) {\n";
+        h << "    va_list ap;\n";
+        h << "    va_start(ap, fmt);\n";
+        h << "    int w = vsnprintf(*p, *rem, fmt, ap);\n";
+        h << "    va_end(ap);\n";
+        h << "    if (w > 0 && (size_t)w < *rem) {\n";
+        h << "        *p += (size_t)w;\n";
+        h << "        *rem -= (size_t)w;\n";
+        h << "    } else if (*rem > 0) {\n";
+        h << "        *rem = 0;\n";
+        h << "    }\n";
+        h << "}\n\n";
+    }
+
+    // Helper for printing structured fields in stdout
+    auto generateStdoutFieldPrinter = [&](auto &self, const Field &f, const std::string &accessor, bool isTopLevel, bool inArray, int loopDepth, const std::string &eol) -> void {
+        std::string prefix = isTopLevel ? " " : "";
+        std::string namePrefix = inArray ? "" : (prefix + f.name + "=");
+        if (f.type_kind == "counted_array") {
+            std::string cnt = getCountExpr(accessor, f.counted_by);
+            std::string lvar = "_i" + std::to_string(loopDepth);
+            std::string cvar = "_cnt" + std::to_string(loopDepth);
+            h << "    {" << eol;
+            if (f.is_pointer) {
+                h << "    size_t " << cvar << " = (((int64_t)(" << cnt << ") > 0) && ((const void *)(" << accessor << ") != NULL)) ? (size_t)(" << cnt << ") : 0;" << eol;
             } else {
-                if (f.is_signed) {
-                    h << "    fprintf(_f, \"" << namePrefix << "%\" PRId64, (int64_t)(" << accessor << "));" << eol;
+                h << "    size_t " << cvar << " = ((int64_t)(" << cnt << ") > 0) ? (size_t)(" << cnt << ") : 0;" << eol;
+            }
+            h << "    __ctrace_buf_append(&_p, &_rem, \"" << prefix << f.name << "=[\");" << eol;
+            h << "    for (size_t " << lvar << " = 0; " << lvar << " < " << cvar << "; ++" << lvar << ") {" << eol;
+            h << "        if (" << lvar << " > 0) __ctrace_buf_append(&_p, &_rem, \", \");" << eol;
+            std::string elemAccessor = "(" + accessor + ")[" + lvar + "]";
+            if (!f.struct_fields.empty()) {
+                const auto &elem = f.struct_fields[0];
+                self(self, elem, elemAccessor, false, true, loopDepth + 1, eol);
+            }
+            h << "    }" << eol;
+            h << "    __ctrace_buf_append(&_p, &_rem, \"]\");" << eol;
+            h << "    }" << eol;
+        } else if (f.type_kind == "struct") {
+            std::string op = f.is_pointer ? "->" : ".";
+            if (f.is_pointer) {
+                h << "    if (!(" << accessor << ")) {" << eol;
+                h << "        __ctrace_buf_append(&_p, &_rem, \"" << (inArray ? "(null)" : (prefix + f.name + "=(null)")) << "\");" << eol;
+                h << "    } else {" << eol;
+            }
+            h << "    __ctrace_buf_append(&_p, &_rem, \"" << (inArray ? "{" : (prefix + f.name + "={")) << "\");" << eol;
+            for (size_t i = 0; i < f.struct_fields.size(); ++i) {
+                const auto &sub = f.struct_fields[i];
+                std::string subAccessor;
+                if (sub.array_index >= 0) {
+                    subAccessor = "(" + accessor + ")" + op + sub.array_parent + "[" + std::to_string(sub.array_index) + "]";
                 } else {
-                    h << "    fprintf(_f, \"" << namePrefix << "%\" PRIu64, (uint64_t)(" << accessor << "));" << eol;
+                    subAccessor = "(" + accessor + ")" + op + sub.name;
+                }
+                if (i > 0) {
+                    h << "    __ctrace_buf_append(&_p, &_rem, \", \");" << eol;
+                }
+                self(self, sub, subAccessor, false, false, loopDepth, eol);
+            }
+            h << "    __ctrace_buf_append(&_p, &_rem, \"}\");" << eol;
+            if (f.is_pointer) {
+                h << "    }" << eol;
+            }
+        } else if (f.type_kind == "fixed_array") {
+            h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "[len=%\" PRIu64 \",hex=\", (uint64_t)" << f.size << ");" << eol;
+            h << "    for (size_t _i = 0; _i < (size_t)" << f.size << " && _i < 16; ++_i) {" << eol;
+            h << "        __ctrace_buf_append(&_p, &_rem, \"%02x\", ((const unsigned char *)(" << accessor << "))[_i]);" << eol;
+            h << "    }" << eol;
+            if ((size_t)f.size > 16) h << "    __ctrace_buf_append(&_p, &_rem, \"...\");" << eol;
+            h << "    __ctrace_buf_append(&_p, &_rem, \"]\");" << eol;
+        } else if (f.type_kind == "union") {
+            h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "[union_len=%\" PRIu64 \",hex=\", (uint64_t)" << f.size << ");" << eol;
+            h << "    for (size_t _i = 0; _i < (size_t)" << f.size << " && _i < 16; ++_i) {" << eol;
+            h << "        __ctrace_buf_append(&_p, &_rem, \"%02x\", ((const unsigned char *)(&(" << accessor << ")))[_i]);" << eol;
+            h << "    }" << eol;
+            if ((size_t)f.size > 16) h << "    __ctrace_buf_append(&_p, &_rem, \"...\");" << eol;
+            h << "    __ctrace_buf_append(&_p, &_rem, \"]\");" << eol;
+        } else if (f.type_kind == "string") {
+            if (!f.is_pointer && f.size > 0) {
+                h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "\\\"%.*s\\\"\", (int)" << f.size << ", " << accessor << ");" << eol;
+            } else {
+                h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "\\\"%s\\\"\", (" << accessor << ") ? (" << accessor << ") : \"(null)\");" << eol;
+            }
+        } else if (f.type_kind == "bytes") {
+            h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "[len=%zu,hex=\", (size_t)(" << accessor << ").len);" << eol;
+            h << "    if ((" << accessor << ").ptr) {" << eol;
+            h << "        for (size_t _i = 0; _i < (" << accessor << ").len && _i < 16; ++_i) {" << eol;
+            h << "            __ctrace_buf_append(&_p, &_rem, \"%02x\", ((const unsigned char *)(" << accessor << ").ptr)[_i]);" << eol;
+            h << "        }" << eol;
+            h << "        if ((" << accessor << ").len > 16) __ctrace_buf_append(&_p, &_rem, \"...\");" << eol;
+            h << "    }" << eol;
+            h << "    __ctrace_buf_append(&_p, &_rem, \"]\");" << eol;
+        } else if (f.type_kind == "bool") {
+            h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "%s\", (" << accessor << ") ? \"true\" : \"false\");" << eol;
+        } else if (f.type_kind == "enum") {
+            if (!f.enum_name.empty()) {
+                h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "%s\", __ctrace_enum_" << f.enum_name << "_to_str((int64_t)(" << accessor << ")));" << eol;
+            } else {
+                h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "%\" PRId64, (int64_t)(" << accessor << "));" << eol;
+            }
+        } else if (f.type_kind == "float" || f.type_kind == "double") {
+            h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "%.6g\", (double)(" << accessor << "));" << eol;
+        } else if (f.is_pointer) {
+            h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "%\" PRIu64, (uint64_t)(uintptr_t)(" << accessor << "));" << eol;
+        } else {
+            if (f.is_signed) {
+                h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "%\" PRId64, (int64_t)(" << accessor << "));" << eol;
+            } else {
+                h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "%\" PRIu64, (uint64_t)(" << accessor << "));" << eol;
+            }
+        }
+    };
+
+    auto emitStdoutEvent = [&](const Event &ev, const std::string &fnPrefix) {
+        bool isMacro = eventHasStructArgs(ev);
+        std::string eol = isMacro ? " \\\n" : "\n";
+
+        emitEmitterHeader(ev, isMacro, eol, fnPrefix);
+        h << "    uint64_t _ts = ctrace_now_ns();" << eol;
+        h << "    char _line_buf[4096];" << eol;
+        h << "    char *_p = _line_buf;" << eol;
+        h << "    size_t _rem = sizeof(_line_buf);" << eol;
+        h << "    __ctrace_buf_append(&_p, &_rem, \"[%" PRIu64 "] " << ev.name << "\", _ts);" << eol;
+
+        for (const auto &fld : ev.fields) {
+            generateStdoutFieldPrinter(generateStdoutFieldPrinter, fld, "__ctrace_v_" + fld.name, true, false, 0, eol);
+        }
+
+        h << "    __ctrace_buf_append(&_p, &_rem, \"\\n\");" << eol;
+        h << "    FILE *_f = ctrace_stdout_acquire();" << eol;
+        h << "    if (_f) { fputs(_line_buf, _f); }" << eol;
+        h << "    ctrace_stdout_release(_f);" << eol;
+        emitEmitterFooter(isMacro);
+    };
+
+    auto emitBinEvent = [&](const Event &ev, const std::string &fnPrefix) {
+        bool isMacro = eventHasStructArgs(ev);
+        std::string eol = isMacro ? " \\\n" : "\n";
+        std::vector<FlatField> flatList = flattenEventFields(ev.fields, true, "__ctrace_v_");
+
+        emitEmitterHeader(ev, isMacro, eol, fnPrefix);
+        emitSafePointerGuards(ev, eol);
+        h << "    uint16_t _ev_id = " << ev.id << ";" << eol;
+        h << "    uint64_t _ts = ctrace_now_ns();" << eol;
+
+        for (const auto &ff : flatList) {
+            if (ff.type_kind == "string") {
+                h << "    uint32_t _len_" << ff.flat_name << " = " << stringLenExpr(ff) << ";" << eol;
+            } else if (ff.type_kind == "bytes") {
+                h << "    uint32_t _len_" << ff.flat_name << " = ((" << ff.accessor_expr << ").ptr && (" << ff.accessor_expr << ").len > 0) ? (uint32_t)(" << ff.accessor_expr << ").len : 0U;" << eol;
+            } else if (ff.type_kind == "counted_array") {
+                emitCountedArraySizeCalc(h, ff, "_len_" + ff.flat_name, 0, false, eol);
+            }
+        }
+
+        h << "    size_t _total_len = sizeof(uint16_t) + sizeof(uint64_t)";
+        for (const auto &ff : flatList) {
+            if (ff.type_kind == "string" || ff.type_kind == "bytes" || ff.type_kind == "counted_array") {
+                h << " + sizeof(uint32_t) + _len_" << ff.flat_name;
+            } else if (ff.type_kind == "fixed_array" || ff.type_kind == "union") {
+                h << " + " << ff.size;
+            } else {
+                h << " + " << ff.size;
+            }
+        }
+        h << ";" << eol;
+
+        h << "    char *_buf = (char *)ctrace_bin_reserve(_total_len);" << eol;
+        h << "    if (_buf) {" << eol;
+        h << "    char *_p = _buf;" << eol;
+        h << "    memcpy(_p, &_ev_id, sizeof(_ev_id)); _p += sizeof(_ev_id);" << eol;
+        h << "    memcpy(_p, &_ts, sizeof(_ts)); _p += sizeof(_ts);" << eol;
+
+        for (const auto &ff : flatList) {
+            if (ff.type_kind == "string") {
+                h << "    memcpy(_p, &_len_" << ff.flat_name << ", 4); _p += 4;" << eol;
+                h << "    if (_len_" << ff.flat_name << " > 0) { memcpy(_p, " << ff.accessor_expr << ", _len_" << ff.flat_name << "); _p += _len_" << ff.flat_name << "; }" << eol;
+            } else if (ff.type_kind == "bytes") {
+                h << "    memcpy(_p, &_len_" << ff.flat_name << ", 4); _p += 4;" << eol;
+                h << "    if (_len_" << ff.flat_name << " > 0) { memcpy(_p, (" << ff.accessor_expr << ").ptr, _len_" << ff.flat_name << "); _p += _len_" << ff.flat_name << "; }" << eol;
+            } else if (ff.type_kind == "counted_array") {
+                emitCountedArraySerialize(h, ff, "_len_" + ff.flat_name, 0, false, eol);
+            } else if (ff.type_kind == "fixed_array") {
+                h << "    memcpy(_p, (const void *)(" << ff.accessor_expr << "), " << ff.size << "); _p += " << ff.size << ";" << eol;
+            } else if (ff.type_kind == "union") {
+                h << "    memcpy(_p, (const void *)(&(" << ff.accessor_expr << ")), " << ff.size << "); _p += " << ff.size << ";" << eol;
+            } else if (ff.type_kind == "bool") {
+                h << "    uint8_t _val_" << ff.flat_name << " = (" << ff.accessor_expr << ") ? 1 : 0;" << eol;
+                h << "    memcpy(_p, &_val_" << ff.flat_name << ", 1); _p += 1;" << eol;
+            } else if (ff.is_pointer) {
+                h << "    uint" << (ff.size * 8) << "_t _val_" << ff.flat_name << " = (uint" << (ff.size * 8) << "_t)(uintptr_t)(" << ff.accessor_expr << ");" << eol;
+                h << "    memcpy(_p, &_val_" << ff.flat_name << ", " << ff.size << "); _p += " << ff.size << ";" << eol;
+            } else {
+                h << "    { __typeof__(" << ff.accessor_expr << ") _val_" << ff.flat_name << " = (" << ff.accessor_expr << "); memcpy(_p, &_val_" << ff.flat_name << ", " << ff.size << "); _p += " << ff.size << "; }" << eol;
+            }
+        }
+
+        h << "    ctrace_bin_commit(_buf, _total_len);" << eol;
+        h << "    }" << eol;
+        emitEmitterFooter(isMacro);
+    };
+
+    auto emitCtfEvent = [&](const Event &ev, const std::string &fnPrefix) {
+        bool isMacro = eventHasStructArgs(ev);
+        std::string eol = isMacro ? " \\\n" : "\n";
+        std::vector<FlatField> flatList = flattenEventFields(ev.fields, true, "__ctrace_v_");
+
+        emitEmitterHeader(ev, isMacro, eol, fnPrefix);
+        emitSafePointerGuards(ev, eol);
+        h << "    uint16_t _ev_id = " << ev.id << ";" << eol;
+        h << "    uint64_t _ts = ctrace_now_ns();" << eol;
+
+        for (const auto &ff : flatList) {
+            if (ff.type_kind == "string") {
+                h << "    uint32_t _len_" << ff.flat_name << " = " << stringLenExpr(ff) << ";" << eol;
+            } else if (ff.type_kind == "bytes") {
+                h << "    uint32_t _len_" << ff.flat_name << " = ((" << ff.accessor_expr << ").ptr && (" << ff.accessor_expr << ").len > 0) ? (uint32_t)(" << ff.accessor_expr << ").len : 0U;" << eol;
+            } else if (ff.type_kind == "counted_array") {
+                emitCountedArraySizeCalc(h, ff, "_len_" + ff.flat_name, 0, true, eol);
+            }
+        }
+
+        h << "    size_t _total_len = sizeof(uint16_t) + sizeof(uint64_t)";
+        for (const auto &ff : flatList) {
+            if (ff.type_kind == "string") {
+                h << " + _len_" << ff.flat_name << " + 1";
+            } else if (ff.type_kind == "bytes" || ff.type_kind == "counted_array") {
+                h << " + sizeof(uint32_t) + _len_" << ff.flat_name;
+            } else if (ff.type_kind == "fixed_array" || ff.type_kind == "union") {
+                h << " + " << ff.size;
+            } else if (ff.type_kind == "enum") {
+                h << " + 4";
+            } else if (ff.type_kind == "bool") {
+                h << " + 1";
+            } else {
+                h << " + " << ff.size;
+            }
+        }
+        h << ";" << eol;
+
+        h << "    char *_buf = (char *)ctrace_ctf_reserve(_total_len);" << eol;
+        h << "    if (_buf) {" << eol;
+        h << "    char *_p = _buf;" << eol;
+        h << "    memcpy(_p, &_ev_id, sizeof(_ev_id)); _p += sizeof(_ev_id);" << eol;
+        h << "    memcpy(_p, &_ts, sizeof(_ts)); _p += sizeof(_ts);" << eol;
+
+        for (const auto &ff : flatList) {
+            if (ff.type_kind == "string") {
+                h << "    if (_len_" << ff.flat_name << " > 0) {" << eol;
+                h << "        memcpy(_p, " << ff.accessor_expr << ", _len_" << ff.flat_name << ");" << eol;
+                h << "        _p += _len_" << ff.flat_name << ";" << eol;
+                h << "    }" << eol;
+                h << "    *_p++ = '\\0';" << eol;
+            } else if (ff.type_kind == "bytes") {
+                h << "    memcpy(_p, &_len_" << ff.flat_name << ", 4); _p += 4;" << eol;
+                h << "    if (_len_" << ff.flat_name << " > 0) {" << eol;
+                h << "        memcpy(_p, (" << ff.accessor_expr << ").ptr, _len_" << ff.flat_name << ");" << eol;
+                h << "        _p += _len_" << ff.flat_name << ";" << eol;
+                h << "    }" << eol;
+            } else if (ff.type_kind == "counted_array") {
+                emitCountedArraySerialize(h, ff, "_len_" + ff.flat_name, 0, true, eol);
+            } else if (ff.type_kind == "fixed_array") {
+                h << "    memcpy(_p, (const void *)(" << ff.accessor_expr << "), " << ff.size << "); _p += " << ff.size << ";" << eol;
+            } else if (ff.type_kind == "union") {
+                h << "    memcpy(_p, (const void *)(&(" << ff.accessor_expr << ")), " << ff.size << "); _p += " << ff.size << ";" << eol;
+            } else if (ff.type_kind == "bool") {
+                h << "    uint8_t _val_" << ff.flat_name << " = (" << ff.accessor_expr << ") ? 1 : 0;" << eol;
+                h << "    memcpy(_p, &_val_" << ff.flat_name << ", 1); _p += 1;" << eol;
+            } else if (ff.type_kind == "enum") {
+                h << "    int32_t _val_" << ff.flat_name << " = (int32_t)(" << ff.accessor_expr << ");" << eol;
+                h << "    memcpy(_p, &_val_" << ff.flat_name << ", 4); _p += 4;" << eol;
+            } else if (ff.is_pointer) {
+                h << "    uint" << (ff.size * 8) << "_t _val_" << ff.flat_name << " = (uint" << (ff.size * 8) << "_t)(uintptr_t)(" << ff.accessor_expr << ");" << eol;
+                h << "    memcpy(_p, &_val_" << ff.flat_name << ", " << ff.size << "); _p += " << ff.size << ";" << eol;
+            } else {
+                h << "    { __typeof__(" << ff.accessor_expr << ") _val_" << ff.flat_name << " = (" << ff.accessor_expr << "); memcpy(_p, &_val_" << ff.flat_name << ", " << ff.size << "); _p += " << ff.size << "; }" << eol;
+            }
+        }
+
+        h << "    ctrace_ctf_commit(_buf, _total_len);" << eol;
+        h << "    }" << eol;
+        emitEmitterFooter(isMacro);
+    };
+
+    auto emitSqliteEvent = [&](const Event &ev, const std::string &fnPrefix) {
+        bool isMacro = eventHasStructArgs(ev);
+        std::string eol = isMacro ? " \\\n" : "\n";
+        std::vector<FlatField> flatList = flattenEventFields(ev.fields, true, "__ctrace_v_");
+
+        emitEmitterHeader(ev, isMacro, eol, fnPrefix);
+        emitSafePointerGuards(ev, eol);
+        h << "    uint64_t _ts = ctrace_now_ns();" << eol;
+        h << "    ctrace_sqlite_lock();" << eol;
+        h << "    sqlite3_stmt *_st = __ctrace_stmt_" << ev.name << ";" << eol;
+        h << "    if (_st) {" << eol;
+        h << "        sqlite3_bind_int64(_st, 1, (sqlite3_int64)_ts);" << eol;
+
+        int col = 2;
+        for (const auto &ff : flatList) {
+            if (ff.type_kind == "string") {
+                if (!ff.is_pointer && ff.size > 0) {
+                    h << "        sqlite3_bind_text(_st, " << col++ << ", " << ff.accessor_expr << ", (int)strnlen(" << ff.accessor_expr << ", " << ff.size << "), SQLITE_TRANSIENT);" << eol;
+                } else {
+                    h << "        sqlite3_bind_text(_st, " << col++ << ", (" << ff.accessor_expr << ") ? (" << ff.accessor_expr << ") : \"\", -1, SQLITE_TRANSIENT);" << eol;
+                }
+            } else if (ff.type_kind == "bytes") {
+                h << "        sqlite3_bind_blob(_st, " << col++ << ", (" << ff.accessor_expr << ").ptr, ((" << ff.accessor_expr << ").ptr && (" << ff.accessor_expr << ").len > 0) ? (int)(" << ff.accessor_expr << ").len : 0, SQLITE_TRANSIENT);" << eol;
+            } else if (ff.type_kind == "fixed_array") {
+                h << "        sqlite3_bind_blob(_st, " << col++ << ", (const void *)(" << ff.accessor_expr << "), (int)" << ff.size << ", SQLITE_TRANSIENT);" << eol;
+            } else if (ff.type_kind == "union") {
+                h << "        sqlite3_bind_blob(_st, " << col++ << ", (const void *)(&(" << ff.accessor_expr << ")), (int)" << ff.size << ", SQLITE_TRANSIENT);" << eol;
+            } else if (ff.type_kind == "counted_array") {
+                if (!ff.struct_fields.empty() && ff.struct_fields[0].type_kind == "struct") {
+                    std::string lenVar = "_len_" + ff.flat_name;
+                    emitCountedArraySizeCalc(h, ff, lenVar, 0, false, eol);
+                    h << "        char *_ca_buf = (char *)malloc((size_t)4 + (size_t)" << lenVar << ");" << eol;
+                    h << "        if (_ca_buf) {" << eol;
+                    h << "            char *_p = _ca_buf;" << eol;
+                    emitCountedArraySerialize(h, ff, lenVar, 0, false, eol);
+                    h << "            sqlite3_bind_blob(_st, " << col++ << ", _ca_buf + 4, (int)" << lenVar << ", SQLITE_TRANSIENT);" << eol;
+                    h << "            free(_ca_buf);" << eol;
+                    h << "        } else {" << eol;
+                    h << "            sqlite3_bind_null(_st, " << col++ << ");" << eol;
+                    h << "        }" << eol;
+                } else {
+                    std::string cnt = getCountExpr(ff.accessor_expr, ff.counted_by);
+                    uint64_t esz = ff.elem_size > 0 ? ff.elem_size : 1;
+                    if (ff.is_pointer) {
+                        h << "        sqlite3_bind_blob(_st, " << col++ << ", (const void *)(" << ff.accessor_expr << "), (((int64_t)(" << cnt << ") > 0) && ((const void *)(" << ff.accessor_expr << ") != NULL)) ? (int)((size_t)(" << cnt << ") * " << esz << ") : 0, SQLITE_TRANSIENT);" << eol;
+                    } else {
+                        h << "        sqlite3_bind_blob(_st, " << col++ << ", (const void *)(" << ff.accessor_expr << "), ((int64_t)(" << cnt << ") > 0) ? (int)((size_t)(" << cnt << ") * " << esz << ") : 0, SQLITE_TRANSIENT);" << eol;
+                    }
+                }
+            } else if (ff.type_kind == "float" || ff.type_kind == "double") {
+                h << "        sqlite3_bind_double(_st, " << col++ << ", (double)(" << ff.accessor_expr << "));" << eol;
+            } else if (ff.type_kind == "bool") {
+                h << "        sqlite3_bind_int(_st, " << col++ << ", (" << ff.accessor_expr << ") ? 1 : 0);" << eol;
+            } else if (ff.is_pointer) {
+                h << "        sqlite3_bind_int64(_st, " << col++ << ", (sqlite3_int64)(uint64_t)(uintptr_t)(" << ff.accessor_expr << "));" << eol;
+            } else {
+                if (ff.is_signed) {
+                    h << "        sqlite3_bind_int64(_st, " << col++ << ", (sqlite3_int64)(" << ff.accessor_expr << "));" << eol;
+                } else {
+                    h << "        sqlite3_bind_int64(_st, " << col++ << ", (sqlite3_int64)(uint64_t)(" << ff.accessor_expr << "));" << eol;
                 }
             }
-        };
+        }
+
+        h << "        sqlite3_step(_st);" << eol;
+        h << "        sqlite3_reset(_st);" << eol;
+        h << "        ctrace_sqlite_step_done();" << eol;
+        h << "    }" << eol;
+        h << "    ctrace_sqlite_unlock();" << eol;
+        emitEmitterFooter(isMacro);
+    };
+
+    if (backend == "stdout") {
+        h << "#include <stdio.h>\n\n";
+        h << "FILE *ctrace_get_stdout_file(void);\n";
+        h << "FILE *ctrace_stdout_acquire(void);\n";
+        h << "void ctrace_stdout_release(FILE *f);\n\n";
+
+        emitEnumHelpers();
 
         for (const auto &pair : events) {
-            const Event &ev = pair.second;
-            bool isMacro = eventHasStructArgs(ev);
-            std::string eol = isMacro ? " \\\n" : "\n";
-
-            emitEmitterHeader(ev, isMacro, eol);
-            h << "    uint64_t _ts = ctrace_now_ns();" << eol;
-            h << "    FILE *_f = ctrace_stdout_acquire();" << eol;
-            h << "    fprintf(_f, \"[%\" PRIu64 \"] " << ev.name << "\", _ts);" << eol;
-
-            for (const auto &fld : ev.fields) {
-                generateStdoutFieldPrinter(generateStdoutFieldPrinter, fld, "__ctrace_v_" + fld.name, true, false, 0, eol);
-            }
-
-            h << "    fprintf(_f, \"\\n\");" << eol;
-            h << "    ctrace_stdout_release(_f);" << eol;
-            emitEmitterFooter(isMacro);
+            emitStdoutEvent(pair.second, "__ctrace_emit_");
         }
     } else if (backend == "bin" || backend == "bin-zstd") {
         h << "void *ctrace_bin_reserve(size_t len);\n";
         h << "void ctrace_bin_commit(void *ptr, size_t len);\n\n";
 
         for (const auto &pair : events) {
-            const Event &ev = pair.second;
-            bool isMacro = eventHasStructArgs(ev);
-            std::string eol = isMacro ? " \\\n" : "\n";
-            std::vector<FlatField> flatList = flattenEventFields(ev.fields, true, "__ctrace_v_");
-
-            emitEmitterHeader(ev, isMacro, eol);
-            emitSafePointerGuards(ev, eol);
-            h << "    uint16_t _ev_id = " << ev.id << ";" << eol;
-            h << "    uint64_t _ts = ctrace_now_ns();" << eol;
-
-            for (const auto &ff : flatList) {
-                if (ff.type_kind == "string") {
-                    h << "    uint32_t _len_" << ff.flat_name << " = " << stringLenExpr(ff) << ";" << eol;
-                } else if (ff.type_kind == "bytes") {
-                    h << "    uint32_t _len_" << ff.flat_name << " = ((" << ff.accessor_expr << ").ptr && (" << ff.accessor_expr << ").len > 0) ? (uint32_t)(" << ff.accessor_expr << ").len : 0U;" << eol;
-                } else if (ff.type_kind == "counted_array") {
-                    emitCountedArraySizeCalc(h, ff, "_len_" + ff.flat_name, 0, false, eol);
-                }
-            }
-
-            h << "    size_t _total_len = sizeof(uint16_t) + sizeof(uint64_t)";
-            for (const auto &ff : flatList) {
-                if (ff.type_kind == "string" || ff.type_kind == "bytes" || ff.type_kind == "counted_array") {
-                    h << " + sizeof(uint32_t) + _len_" << ff.flat_name;
-                } else {
-                    h << " + " << ff.size;
-                }
-            }
-            h << ";" << eol;
-
-            h << "    char *_buf = (char *)ctrace_bin_reserve(_total_len);" << eol;
-            h << "    if (_buf) {" << eol;
-            h << "    char *_p = _buf;" << eol;
-            h << "    memcpy(_p, &_ev_id, sizeof(_ev_id)); _p += sizeof(_ev_id);" << eol;
-            h << "    memcpy(_p, &_ts, sizeof(_ts)); _p += sizeof(_ts);" << eol;
-
-            for (const auto &ff : flatList) {
-                if (ff.type_kind == "string") {
-                    h << "    memcpy(_p, &_len_" << ff.flat_name << ", 4); _p += 4;" << eol;
-                    h << "    if (_len_" << ff.flat_name << " > 0) { memcpy(_p, " << ff.accessor_expr << ", _len_" << ff.flat_name << "); _p += _len_" << ff.flat_name << "; }" << eol;
-                } else if (ff.type_kind == "bytes") {
-                    h << "    memcpy(_p, &_len_" << ff.flat_name << ", 4); _p += 4;" << eol;
-                    h << "    if (_len_" << ff.flat_name << " > 0) { memcpy(_p, (" << ff.accessor_expr << ").ptr, _len_" << ff.flat_name << "); _p += _len_" << ff.flat_name << "; }" << eol;
-                } else if (ff.type_kind == "counted_array") {
-                    emitCountedArraySerialize(h, ff, "_len_" + ff.flat_name, 0, false, eol);
-                } else if (ff.type_kind == "bool") {
-                    h << "    uint8_t _val_" << ff.flat_name << " = (" << ff.accessor_expr << ") ? 1 : 0;" << eol;
-                    h << "    memcpy(_p, &_val_" << ff.flat_name << ", 1); _p += 1;" << eol;
-                } else if (ff.is_pointer) {
-                    h << "    uint" << (ff.size * 8) << "_t _val_" << ff.flat_name << " = (uint" << (ff.size * 8) << "_t)(uintptr_t)(" << ff.accessor_expr << ");" << eol;
-                    h << "    memcpy(_p, &_val_" << ff.flat_name << ", " << ff.size << "); _p += " << ff.size << ";" << eol;
-                } else {
-                    h << "    { __typeof__(" << ff.accessor_expr << ") _val_" << ff.flat_name << " = (" << ff.accessor_expr << "); memcpy(_p, &_val_" << ff.flat_name << ", " << ff.size << "); _p += " << ff.size << "; }" << eol;
-                }
-            }
-
-            h << "    ctrace_bin_commit(_buf, _total_len);" << eol;
-            h << "    }" << eol;
-            emitEmitterFooter(isMacro);
+            emitBinEvent(pair.second, "__ctrace_emit_");
         }
     } else if (backend == "ctf") {
         h << "void *ctrace_ctf_reserve(size_t len);\n";
@@ -945,80 +1182,7 @@ int main(int argc, char **argv) {
         h << "}\n\n";
 
         for (const auto &pair : events) {
-            const Event &ev = pair.second;
-            bool isMacro = eventHasStructArgs(ev);
-            std::string eol = isMacro ? " \\\n" : "\n";
-            std::vector<FlatField> flatList = flattenEventFields(ev.fields, true, "__ctrace_v_");
-
-            emitEmitterHeader(ev, isMacro, eol);
-            emitSafePointerGuards(ev, eol);
-            h << "    uint16_t _ev_id = " << ev.id << ";" << eol;
-            h << "    uint64_t _ts = ctrace_now_ns();" << eol;
-
-            for (const auto &ff : flatList) {
-                if (ff.type_kind == "string") {
-                    h << "    uint32_t _len_" << ff.flat_name << " = " << stringLenExpr(ff) << ";" << eol;
-                } else if (ff.type_kind == "bytes") {
-                    h << "    uint32_t _len_" << ff.flat_name << " = ((" << ff.accessor_expr << ").ptr && (" << ff.accessor_expr << ").len > 0) ? (uint32_t)(" << ff.accessor_expr << ").len : 0U;" << eol;
-                } else if (ff.type_kind == "counted_array") {
-                    emitCountedArraySizeCalc(h, ff, "_len_" + ff.flat_name, 0, true, eol);
-                }
-            }
-
-            h << "    size_t _total_len = sizeof(uint16_t) + sizeof(uint64_t)";
-            for (const auto &ff : flatList) {
-                if (ff.type_kind == "string") {
-                    h << " + _len_" << ff.flat_name << " + 1";
-                } else if (ff.type_kind == "bytes" || ff.type_kind == "counted_array") {
-                    h << " + sizeof(uint32_t) + _len_" << ff.flat_name;
-                } else if (ff.type_kind == "enum") {
-                    h << " + 4";
-                } else if (ff.type_kind == "bool") {
-                    h << " + 1";
-                } else {
-                    h << " + " << ff.size;
-                }
-            }
-            h << ";" << eol;
-
-            h << "    char *_buf = (char *)ctrace_ctf_reserve(_total_len);" << eol;
-            h << "    if (_buf) {" << eol;
-            h << "    char *_p = _buf;" << eol;
-            h << "    memcpy(_p, &_ev_id, sizeof(_ev_id)); _p += sizeof(_ev_id);" << eol;
-            h << "    memcpy(_p, &_ts, sizeof(_ts)); _p += sizeof(_ts);" << eol;
-
-            for (const auto &ff : flatList) {
-                if (ff.type_kind == "string") {
-                    h << "    if (_len_" << ff.flat_name << " > 0) {" << eol;
-                    h << "        memcpy(_p, " << ff.accessor_expr << ", _len_" << ff.flat_name << ");" << eol;
-                    h << "        _p += _len_" << ff.flat_name << ";" << eol;
-                    h << "    }" << eol;
-                    h << "    *_p++ = '\\0';" << eol;
-                } else if (ff.type_kind == "bytes") {
-                    h << "    memcpy(_p, &_len_" << ff.flat_name << ", 4); _p += 4;" << eol;
-                    h << "    if (_len_" << ff.flat_name << " > 0) {" << eol;
-                    h << "        memcpy(_p, (" << ff.accessor_expr << ").ptr, _len_" << ff.flat_name << ");" << eol;
-                    h << "        _p += _len_" << ff.flat_name << ";" << eol;
-                    h << "    }" << eol;
-                } else if (ff.type_kind == "counted_array") {
-                    emitCountedArraySerialize(h, ff, "_len_" + ff.flat_name, 0, true, eol);
-                } else if (ff.type_kind == "bool") {
-                    h << "    uint8_t _val_" << ff.flat_name << " = (" << ff.accessor_expr << ") ? 1 : 0;" << eol;
-                    h << "    memcpy(_p, &_val_" << ff.flat_name << ", 1); _p += 1;" << eol;
-                } else if (ff.type_kind == "enum") {
-                    h << "    int32_t _val_" << ff.flat_name << " = (int32_t)(" << ff.accessor_expr << ");" << eol;
-                    h << "    memcpy(_p, &_val_" << ff.flat_name << ", 4); _p += 4;" << eol;
-                } else if (ff.is_pointer) {
-                    h << "    uint" << (ff.size * 8) << "_t _val_" << ff.flat_name << " = (uint" << (ff.size * 8) << "_t)(uintptr_t)(" << ff.accessor_expr << ");" << eol;
-                    h << "    memcpy(_p, &_val_" << ff.flat_name << ", " << ff.size << "); _p += " << ff.size << ";" << eol;
-                } else {
-                    h << "    { __typeof__(" << ff.accessor_expr << ") _val_" << ff.flat_name << " = (" << ff.accessor_expr << "); memcpy(_p, &_val_" << ff.flat_name << ", " << ff.size << "); _p += " << ff.size << "; }" << eol;
-                }
-            }
-
-            h << "    ctrace_ctf_commit(_buf, _total_len);" << eol;
-            h << "    }" << eol;
-            emitEmitterFooter(isMacro);
+            emitCtfEvent(pair.second, "__ctrace_emit_");
         }
     } else if (backend == "sqlite") {
         h << "#include <sqlite3.h>\n";
@@ -1082,72 +1246,50 @@ int main(int argc, char **argv) {
         h << "}\n\n";
 
         for (const auto &pair : events) {
+            emitSqliteEvent(pair.second, "__ctrace_emit_");
+        }
+    } else if (backend == "runtime" || backend == "multi") {
+        h << "#include <stdio.h>\n";
+        h << "#include <stdlib.h>\n\n";
+        h << "FILE *ctrace_get_stdout_file(void);\n";
+        h << "FILE *ctrace_stdout_acquire(void);\n";
+        h << "void ctrace_stdout_release(FILE *f);\n";
+        h << "void *ctrace_bin_reserve(size_t len);\n";
+        h << "void ctrace_bin_commit(void *ptr, size_t len);\n";
+        h << "void *ctrace_ctf_reserve(size_t len);\n";
+        h << "void ctrace_ctf_commit(void *ptr, size_t len);\n";
+        h << "void ctrace_ctf_set_metadata(const char *metadata);\n\n";
+
+        h << "static const char __ctrace_ctf_metadata[] = {\n    ";
+        for (size_t i = 0; i < ctfTsdl.size(); ++i) {
+            h << "0x" << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)ctfTsdl[i] << std::dec << ", ";
+            if ((i + 1) % 12 == 0) h << "\n    ";
+        }
+        h << "0x00\n};\n\n";
+
+        h << "__attribute__((constructor)) static void __ctrace_ctf_register_meta(void) {\n";
+        h << "    ctrace_ctf_set_metadata(__ctrace_ctf_metadata);\n";
+        h << "}\n\n";
+
+        emitEnumHelpers();
+
+        for (const auto &pair : events) {
+            emitStdoutEvent(pair.second, "__ctrace_emit_stdout_");
+            emitBinEvent(pair.second, "__ctrace_emit_bin_");
+            emitCtfEvent(pair.second, "__ctrace_emit_ctf_");
+        }
+
+        h << "extern int g_ctrace_active_backend;\n\n";
+        for (const auto &pair : events) {
             const Event &ev = pair.second;
-            bool isMacro = eventHasStructArgs(ev);
-            std::string eol = isMacro ? " \\\n" : "\n";
-            std::vector<FlatField> flatList = flattenEventFields(ev.fields, true, "__ctrace_v_");
-
-            emitEmitterHeader(ev, isMacro, eol);
-            emitSafePointerGuards(ev, eol);
-            h << "    uint64_t _ts = ctrace_now_ns();" << eol;
-            h << "    ctrace_sqlite_lock();" << eol;
-            h << "    sqlite3_stmt *_st = __ctrace_stmt_" << ev.name << ";" << eol;
-            h << "    if (_st) {" << eol;
-            h << "        sqlite3_bind_int64(_st, 1, (sqlite3_int64)_ts);" << eol;
-
-            int col = 2;
-            for (const auto &ff : flatList) {
-                if (ff.type_kind == "string") {
-                    if (!ff.is_pointer && ff.size > 0) {
-                        h << "        sqlite3_bind_text(_st, " << col++ << ", " << ff.accessor_expr << ", (int)strnlen(" << ff.accessor_expr << ", " << ff.size << "), SQLITE_TRANSIENT);" << eol;
-                    } else {
-                        h << "        sqlite3_bind_text(_st, " << col++ << ", (" << ff.accessor_expr << ") ? (" << ff.accessor_expr << ") : \"\", -1, SQLITE_TRANSIENT);" << eol;
-                    }
-                } else if (ff.type_kind == "bytes") {
-                    h << "        sqlite3_bind_blob(_st, " << col++ << ", (" << ff.accessor_expr << ").ptr, ((" << ff.accessor_expr << ").ptr && (" << ff.accessor_expr << ").len > 0) ? (int)(" << ff.accessor_expr << ").len : 0, SQLITE_TRANSIENT);" << eol;
-                } else if (ff.type_kind == "counted_array") {
-                    if (!ff.struct_fields.empty() && ff.struct_fields[0].type_kind == "struct") {
-                        std::string lenVar = "_len_" + ff.flat_name;
-                        emitCountedArraySizeCalc(h, ff, lenVar, 0, false, eol);
-                        h << "        char *_ca_buf = (char *)malloc((size_t)4 + (size_t)" << lenVar << ");" << eol;
-                        h << "        if (_ca_buf) {" << eol;
-                        h << "            char *_p = _ca_buf;" << eol;
-                        emitCountedArraySerialize(h, ff, lenVar, 0, false, eol);
-                        h << "            sqlite3_bind_blob(_st, " << col++ << ", _ca_buf + 4, (int)" << lenVar << ", SQLITE_TRANSIENT);" << eol;
-                        h << "            free(_ca_buf);" << eol;
-                        h << "        } else {" << eol;
-                        h << "            sqlite3_bind_null(_st, " << col++ << ");" << eol;
-                        h << "        }" << eol;
-                    } else {
-                        std::string cnt = getCountExpr(ff.accessor_expr, ff.counted_by);
-                        uint64_t esz = ff.elem_size > 0 ? ff.elem_size : 1;
-                        if (ff.is_pointer) {
-                            h << "        sqlite3_bind_blob(_st, " << col++ << ", (const void *)(" << ff.accessor_expr << "), (((int64_t)(" << cnt << ") > 0) && ((const void *)(" << ff.accessor_expr << ") != NULL)) ? (int)((size_t)(" << cnt << ") * " << esz << ") : 0, SQLITE_TRANSIENT);" << eol;
-                        } else {
-                            h << "        sqlite3_bind_blob(_st, " << col++ << ", (const void *)(" << ff.accessor_expr << "), ((int64_t)(" << cnt << ") > 0) ? (int)((size_t)(" << cnt << ") * " << esz << ") : 0, SQLITE_TRANSIENT);" << eol;
-                        }
-                    }
-                } else if (ff.type_kind == "float" || ff.type_kind == "double") {
-                    h << "        sqlite3_bind_double(_st, " << col++ << ", (double)(" << ff.accessor_expr << "));" << eol;
-                } else if (ff.type_kind == "bool") {
-                    h << "        sqlite3_bind_int(_st, " << col++ << ", (" << ff.accessor_expr << ") ? 1 : 0);" << eol;
-                } else if (ff.is_pointer) {
-                    h << "        sqlite3_bind_int64(_st, " << col++ << ", (sqlite3_int64)(uint64_t)(uintptr_t)(" << ff.accessor_expr << "));" << eol;
-                } else {
-                    if (ff.is_signed) {
-                        h << "        sqlite3_bind_int64(_st, " << col++ << ", (sqlite3_int64)(" << ff.accessor_expr << "));" << eol;
-                    } else {
-                        h << "        sqlite3_bind_int64(_st, " << col++ << ", (sqlite3_int64)(uint64_t)(" << ff.accessor_expr << "));" << eol;
-                    }
-                }
-            }
-
-            h << "        sqlite3_step(_st);" << eol;
-            h << "        sqlite3_reset(_st);" << eol;
-            h << "        ctrace_sqlite_step_done();" << eol;
-            h << "    }" << eol;
-            h << "    ctrace_sqlite_unlock();" << eol;
-            emitEmitterFooter(isMacro);
+            h << "#define __ctrace_emit_" << ev.name << "(...) do { \\\n";
+            h << "    switch (g_ctrace_active_backend) { \\\n";
+            h << "        case 1: __ctrace_emit_stdout_" << ev.name << "(__VA_ARGS__); break; \\\n";
+            h << "        case 2: __ctrace_emit_bin_" << ev.name << "(__VA_ARGS__); break; \\\n";
+            h << "        case 3: __ctrace_emit_ctf_" << ev.name << "(__VA_ARGS__); break; \\\n";
+            h << "        default: break; \\\n";
+            h << "    } \\\n";
+            h << "} while (0)\n\n";
         }
     }
 

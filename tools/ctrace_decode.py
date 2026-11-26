@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ctrace_decode.py - Offline decoder for ctrace binary streams (bin and bin-zstd).
+ctrace_decode.py - High-performance offline decoder for ctrace binary streams.
 """
 
 import sys
@@ -49,6 +49,9 @@ def _flatten_fields_raw(fields, prefix=""):
                 "is_signed": f.get("is_signed", False),
                 "constants": f.get("constants", []),
                 "fields": f.get("fields", []),
+                "counted_by": f.get("counted_by", ""),
+                "tag_field": f.get("tag_field", ""),
+                "union_cases": f.get("union_cases", []),
             })
     return flat
 
@@ -69,7 +72,7 @@ def flatten_schema_fields(fields):
         result.append(ff_copy)
     return result
 
-def decode_field_value(stream_data, offset, total_len, fld):
+def decode_field_value(stream_data, offset, total_len, fld, current_record=None):
     """Decodes a single flat field at offset, returning (value, new_offset) or (None, None) on truncation."""
     ftype = fld["type"]
 
@@ -95,6 +98,59 @@ def decode_field_value(stream_data, offset, total_len, fld):
         offset += blen
         return b_data.hex(), offset
 
+    if ftype == "fixed_array":
+        sz = fld.get("size", 0)
+        if offset + sz > total_len:
+            return None, None
+        arr_bytes = stream_data[offset:offset + sz]
+        offset += sz
+        sub_fields = fld.get("fields", [])
+        if sub_fields:
+            elem_schema = sub_fields[0]
+            elem_type = elem_schema.get("type", "uint8")
+            if elem_type in TYPE_FORMATS and TYPE_FORMATS[elem_type][1] > 1:
+                fmt, esz = TYPE_FORMATS[elem_type]
+                cnt = sz // esz
+                vals = list(struct.unpack_from(f"<{cnt}{fmt[1:] if fmt.startswith('<') else fmt}", arr_bytes, 0))
+                return vals, offset
+        return list(arr_bytes), offset
+
+    if ftype == "struct":
+        sub_fields = fld.get("fields", [])
+        sub_flat = flatten_schema_fields(sub_fields)
+        res_dict = {}
+        sub_off = offset
+        for sf in sub_flat:
+            val, next_off = decode_field_value(stream_data, sub_off, total_len, sf, res_dict)
+            if next_off is None:
+                return None, None
+            res_dict[sf["name"]] = val
+            sub_off = next_off
+        return res_dict, sub_off
+
+    if ftype == "union":
+        sz = fld.get("size", 0)
+        if offset + sz > total_len:
+            return None, None
+        u_data = stream_data[offset:offset + sz]
+        offset += sz
+        tag_field = fld.get("tag_field") or fld.get("counted_by", "")
+        cases = fld.get("union_cases", [])
+        if current_record is not None:
+            tag_val = current_record.get(tag_field)
+            if tag_val is None and tag_field:
+                for k, v in current_record.items():
+                    if k == tag_field or k.endswith(f"_{tag_field}"):
+                        tag_val = v
+                        break
+            if tag_val is not None:
+                for c in cases:
+                    c_tag = c.get("array_index") if "array_index" in c else c.get("tag_val")
+                    if c_tag == tag_val or str(c.get("tag_val_str")) == str(tag_val) or str(c.get("array_parent")) == str(tag_val):
+                        val, _ = decode_field_value(u_data, 0, sz, c)
+                        return {c["name"]: val}, offset
+        return u_data.hex(), offset
+
     if ftype == "counted_array":
         if offset + 4 > total_len:
             return None, None
@@ -118,7 +174,7 @@ def decode_field_value(stream_data, offset, total_len, fld):
             while sub_off < end_offset:
                 item_obj = {}
                 for sf in elem_flat:
-                    val, next_off = decode_field_value(stream_data, sub_off, end_offset, sf)
+                    val, next_off = decode_field_value(stream_data, sub_off, end_offset, sf, item_obj)
                     if next_off is None:
                         return None, None
                     item_obj[sf["name"]] = val
@@ -167,52 +223,108 @@ def decode_field_value(stream_data, offset, total_len, fld):
     offset += sz
     return val, offset
 
+class FastEventDecoder:
+    def __init__(self, ev_schema):
+        self.name = ev_schema["name"]
+        self.id = ev_schema["id"]
+        self.flat_fields = flatten_schema_fields(ev_schema.get("fields", []))
+        
+        # Check if all fields are contiguous scalars for single-pass struct unpacking
+        self.is_all_fixed = True
+        fmt_parts = ["<HQ"]  # event_id (uint16), ts_ns (uint64)
+        total_size = 10
+        self.scalar_meta = []  # (name, is_bool, enum_map)
+
+        for fld in self.flat_fields:
+            ftype = fld["type"]
+            if ftype in TYPE_FORMATS and ftype != "bool":
+                code, sz = TYPE_FORMATS[ftype]
+                fmt_parts.append(code[1:] if code.startswith("<") else code)
+                total_size += sz
+                self.scalar_meta.append((fld["name"], False, None))
+            elif ftype == "bool":
+                fmt_parts.append("B")
+                total_size += 1
+                self.scalar_meta.append((fld["name"], True, None))
+            elif ftype == "enum":
+                sz = fld.get("size", 4)
+                code = "i" if sz == 4 else ("h" if sz == 2 else ("b" if sz == 1 else "q"))
+                fmt_parts.append(code)
+                total_size += sz
+                cmap = {c["value"]: c["name"] for c in fld.get("constants", [])}
+                self.scalar_meta.append((fld["name"], False, cmap))
+            else:
+                self.is_all_fixed = False
+                break
+
+        if self.is_all_fixed:
+            self.struct_obj = struct.Struct("".join(fmt_parts))
+            self.fixed_size = total_size
+        else:
+            self.struct_obj = None
+
 def decode_stream(stream_data, schema):
-    events_by_id = {}
+    decoders = {}
     for ev in schema.get("events", []):
-        ev_copy = dict(ev)
-        ev_copy["flat_fields"] = flatten_schema_fields(ev.get("fields", []))
-        events_by_id[ev["id"]] = ev_copy
+        decoders[ev["id"]] = FastEventDecoder(ev)
 
     offset = 0
     total_len = len(stream_data)
     decoded = []
 
     while offset + 10 <= total_len:
-        ev_id, ts_ns = struct.unpack_from("<HQ", stream_data, offset)
-        offset += 10
+        ev_id, = struct.unpack_from("<H", stream_data, offset)
+        if ev_id not in decoders:
+            raise ValueError(f"Unknown event_id {ev_id} at stream byte offset {offset}")
 
-        if ev_id not in events_by_id:
-            raise ValueError(f"Unknown event_id {ev_id} at stream byte offset {offset - 10}")
-
-        ev_info = events_by_id[ev_id]
-        record = {
-            "event": ev_info["name"],
-            "event_id": ev_id,
-            "timestamp_ns": ts_ns,
-            "fields": {}
-        }
-
-        truncated = False
-        for fld in ev_info["flat_fields"]:
-            fname = fld["name"]
-            val, next_offset = decode_field_value(stream_data, offset, total_len, fld)
-            if next_offset is None:
-                truncated = True
+        dec = decoders[ev_id]
+        if dec.struct_obj:
+            if offset + dec.fixed_size > total_len:
                 break
-            record["fields"][fname] = val
-            offset = next_offset
+            vals = dec.struct_obj.unpack_from(stream_data, offset)
+            offset += dec.fixed_size
+            ts_ns = vals[1]
+            fields = {}
+            for idx, (name, is_bool, emap) in enumerate(dec.scalar_meta):
+                v = vals[2 + idx]
+                if is_bool:
+                    v = bool(v)
+                elif emap is not None:
+                    v = emap.get(v, str(v))
+                fields[name] = v
+            decoded.append({
+                "event": dec.name,
+                "event_id": ev_id,
+                "timestamp_ns": ts_ns,
+                "fields": fields
+            })
+        else:
+            ev_id, ts_ns = struct.unpack_from("<HQ", stream_data, offset)
+            offset += 10
+            record = {
+                "event": dec.name,
+                "event_id": ev_id,
+                "timestamp_ns": ts_ns,
+                "fields": {}
+            }
+            truncated = False
+            for fld in dec.flat_fields:
+                fname = fld["name"]
+                val, next_offset = decode_field_value(stream_data, offset, total_len, fld, record["fields"])
+                if next_offset is None:
+                    truncated = True
+                    break
+                record["fields"][fname] = val
+                offset = next_offset
 
-        if truncated:
-            raise ValueError(f"Truncated event '{ev_info['name']}' in binary stream")
-
-        decoded.append(record)
+            if truncated:
+                raise ValueError(f"Truncated event '{dec.name}' in binary stream")
+            decoded.append(record)
 
     decoded.sort(key=lambda r: r["timestamp_ns"])
     return decoded
 
 def decompress_zstd_chunks(data):
-    # Framed format: [ uint32_t comp_len ][ zstd_frame ]
     decompressed = bytearray()
     offset = 0
     total = len(data)
@@ -239,7 +351,6 @@ def decompress_zstd_chunks(data):
             concat_frames.extend(chunk)
 
     if dctx is None and len(concat_frames) > 0:
-        # Zstandard specification guarantees concatenated frames decompress in a single pass
         proc = subprocess.run(
             ["zstd", "-d", "-c"],
             input=bytes(concat_frames),
@@ -271,9 +382,21 @@ def main():
         stream_data = raw_data
 
     events = decode_stream(stream_data, schema)
+    
+    # Fast buffered output (chunking into 64 KB writes)
+    chunk = []
+    chunk_len = 0
     for ev in events:
         field_strs = [f"{k}={v}" for k, v in ev["fields"].items()]
-        print(f"[{ev['timestamp_ns']}] {ev['event']} {' '.join(field_strs)}")
+        line = f"[{ev['timestamp_ns']}] {ev['event']} {' '.join(field_strs)}\n"
+        chunk.append(line)
+        chunk_len += len(line)
+        if chunk_len >= 65536:
+            sys.stdout.write("".join(chunk))
+            chunk.clear()
+            chunk_len = 0
+    if chunk:
+        sys.stdout.write("".join(chunk))
 
 if __name__ == "__main__":
     main()

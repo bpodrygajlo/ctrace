@@ -100,18 +100,21 @@ add_executable(ctrace::ctrace-gen ALIAS ctrace-gen)
 # 1. ctrace_rt_stdout (Pure C / POSIX, no external dependencies)
 add_library(ctrace_rt_stdout STATIC runtime/rt_common.c)
 target_compile_definitions(ctrace_rt_stdout PRIVATE CTRACE_RUNTIME)
+target_compile_options(ctrace_rt_stdout PRIVATE -Wall -Wextra)
 target_link_libraries(ctrace_rt_stdout PUBLIC ctrace_headers Threads::Threads)
 add_library(ctrace::ctrace_rt_stdout ALIAS ctrace_rt_stdout)
 
 # 2. ctrace_rt_bin (Pure C / POSIX, no external dependencies)
 add_library(ctrace_rt_bin STATIC runtime/rt_common.c runtime/rt_ringbuf.c)
 target_compile_definitions(ctrace_rt_bin PRIVATE CTRACE_RUNTIME CTRACE_BACKEND_CUSTOM)
+target_compile_options(ctrace_rt_bin PRIVATE -Wall -Wextra)
 target_link_libraries(ctrace_rt_bin PUBLIC ctrace_headers Threads::Threads)
 add_library(ctrace::ctrace_rt_bin ALIAS ctrace_rt_bin)
 
 # 3. ctrace_rt_ctf (Common Trace Format, no external dependencies)
 add_library(ctrace_rt_ctf STATIC runtime/rt_common.c runtime/rt_ctf.c)
 target_compile_definitions(ctrace_rt_ctf PRIVATE CTRACE_RUNTIME CTRACE_BACKEND_CUSTOM)
+target_compile_options(ctrace_rt_ctf PRIVATE -Wall -Wextra)
 target_link_libraries(ctrace_rt_ctf PUBLIC ctrace_headers Threads::Threads)
 add_library(ctrace::ctrace_rt_ctf ALIAS ctrace_rt_ctf)
 
@@ -119,6 +122,7 @@ add_library(ctrace::ctrace_rt_ctf ALIAS ctrace_rt_ctf)
 if(CTRACE_HAVE_ZSTD)
     add_library(ctrace_rt_bin-zstd STATIC runtime/rt_common.c runtime/rt_zstd.c)
     target_compile_definitions(ctrace_rt_bin-zstd PRIVATE CTRACE_RUNTIME CTRACE_BACKEND_CUSTOM)
+    target_compile_options(ctrace_rt_bin-zstd PRIVATE -Wall -Wextra)
     target_link_libraries(ctrace_rt_bin-zstd PUBLIC ctrace_headers Threads::Threads ${ZSTD_LIB})
     add_library(ctrace_rt_bin_zstd ALIAS ctrace_rt_bin-zstd)
     add_library(ctrace::ctrace_rt_bin-zstd ALIAS ctrace_rt_bin-zstd)
@@ -129,12 +133,28 @@ endif()
 if(CTRACE_HAVE_SQLITE)
     add_library(ctrace_rt_sqlite STATIC runtime/rt_common.c runtime/rt_sqlite.c)
     target_compile_definitions(ctrace_rt_sqlite PRIVATE CTRACE_RUNTIME CTRACE_BACKEND_CUSTOM CTRACE_BACKEND_SQLITE)
+    target_compile_options(ctrace_rt_sqlite PRIVATE -Wall -Wextra)
     target_link_libraries(ctrace_rt_sqlite PUBLIC ctrace_headers Threads::Threads SQLite::SQLite3)
     add_library(ctrace::ctrace_rt_sqlite ALIAS ctrace_rt_sqlite)
 endif()
 
-# Include the CMake integration function
-set(CTRACE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+# 6. ctrace_rt_runtime (Multi-backend runtime selectable via CTRACE_BACKEND env var)
+set(CTRACE_RT_RUNTIME_SRCS
+    runtime/rt_runtime.c
+    runtime/rt_common.c
+    runtime/rt_ringbuf.c
+    runtime/rt_ctf.c
+)
+add_library(ctrace_rt_runtime STATIC ${CTRACE_RT_RUNTIME_SRCS})
+target_compile_definitions(ctrace_rt_runtime PRIVATE CTRACE_RUNTIME CTRACE_BACKEND_CUSTOM CTRACE_MULTI_BACKEND)
+target_compile_options(ctrace_rt_runtime PRIVATE -Wall -Wextra)
+target_link_libraries(ctrace_rt_runtime PUBLIC ctrace_headers Threads::Threads)
+add_library(ctrace::ctrace_rt_runtime ALIAS ctrace_rt_runtime)
+add_library(ctrace_rt_multi ALIAS ctrace_rt_runtime)
+add_library(ctrace::ctrace_rt_multi ALIAS ctrace_rt_runtime)
+
+# Include the CMake integration function (CACHE INTERNAL so parent projects via CPM / add_subdirectory always see it)
+set(CTRACE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include" CACHE INTERNAL "Path to ctrace public include directory" FORCE)
 include(cmake/ctrace.cmake)
 
 # Installation & CMake package export
@@ -146,7 +166,7 @@ install(TARGETS ctrace-scan ctrace-gen
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-set(CTRACE_INSTALL_TARGETS ctrace_headers ctrace_rt_stdout ctrace_rt_bin ctrace_rt_ctf)
+set(CTRACE_INSTALL_TARGETS ctrace_headers ctrace_rt_stdout ctrace_rt_bin ctrace_rt_ctf ctrace_rt_runtime)
 if(CTRACE_HAVE_ZSTD)
     list(APPEND CTRACE_INSTALL_TARGETS ctrace_rt_bin-zstd)
 endif()

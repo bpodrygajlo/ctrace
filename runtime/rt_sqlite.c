@@ -86,13 +86,24 @@ void ctrace_sqlite_step_done(void) {
     }
 }
 
-void ctrace_init(const char *target_uri) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_init_sqlite(const char *target_uri)
+#else
+void ctrace_init(const char *target_uri)
+#endif
+{
     ctrace_calibrate_tsc();
     pthread_mutex_lock(&g_sqlite_mutex);
 
     close_sqlite_db_locked();
 
     const char *db_path = target_uri;
+    if (!db_path || strcmp(db_path, "") == 0) {
+        db_path = getenv("CTRACE_OUTPUT_PATH");
+        if (!db_path || strcmp(db_path, "") == 0) {
+            db_path = getenv("CTRACE_FILE");
+        }
+    }
     if (!db_path || strcmp(db_path, "") == 0) {
         db_path = "trace.db";
     }
@@ -136,7 +147,12 @@ void ctrace_init(const char *target_uri) {
     pthread_mutex_unlock(&g_sqlite_mutex);
 }
 
-void ctrace_flush(void) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_flush_sqlite(void)
+#else
+void ctrace_flush(void)
+#endif
+{
     pthread_mutex_lock(&g_sqlite_mutex);
     if (g_db && g_in_transaction) {
         sqlite3_exec(g_db, "COMMIT; BEGIN TRANSACTION;", NULL, NULL, NULL);
@@ -146,7 +162,12 @@ void ctrace_flush(void) {
     pthread_mutex_unlock(&g_sqlite_mutex);
 }
 
-void ctrace_shutdown(void) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_shutdown_sqlite(void)
+#else
+void ctrace_shutdown(void)
+#endif
+{
     pthread_mutex_lock(&g_sqlite_mutex);
     close_sqlite_db_locked();
     pthread_mutex_unlock(&g_sqlite_mutex);

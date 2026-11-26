@@ -65,6 +65,23 @@ struct EventInfo {
 
 std::map<std::tuple<std::string, std::string, unsigned, unsigned>, EventInfo> g_collected_events;
 
+struct UnionCaseBinding {
+    std::string tag_field;
+    std::string tag_val_str;
+    int64_t tag_val = 0;
+    bool has_numeric_tag = false;
+    std::string member_name;
+};
+
+std::map<std::pair<std::string, std::string>, std::string> g_bound_counts;
+std::map<std::string, std::vector<UnionCaseBinding>> g_bound_unions;
+
+std::string stripStructPrefix(const std::string &s) {
+    if (s.rfind("struct ", 0) == 0) return s.substr(7);
+    if (s.rfind("union ", 0) == 0) return s.substr(6);
+    return s;
+}
+
 std::string getCountedByField(const FieldDecl *FD) {
     if (!FD) return "";
     for (const auto *A : FD->specific_attrs<AnnotateAttr>()) {
@@ -238,14 +255,74 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
         f.c_type = f.struct_name.empty() ? qualType.getAsString() : (RD->getNameAsString().empty() ? f.struct_name : "struct " + f.struct_name);
         f.size = Ctx.getTypeSize(canon) / 8;
 
+        std::string sName = stripStructPrefix(f.struct_name);
+
         for (const FieldDecl *FD : RD->fields()) {
-            if (FD->isBitField() || FD->getNameAsString().empty()) {
+            if (FD->isBitField()) {
                 continue;
             }
+            std::string fieldName = FD->getNameAsString();
             QualType ft = FD->getType();
+            QualType ftCanon = ft.getCanonicalType();
+
+            // Check if field is a union (named or anonymous)
+            if (ftCanon->isUnionType()) {
+                std::string uName = fieldName.empty() ? "u" : fieldName;
+                const auto *RT = ftCanon->getAs<RecordType>();
+                const RecordDecl *UD = RT ? RT->getDecl() : nullptr;
+                if (UD && UD->getDefinition()) UD = UD->getDefinition();
+                uint64_t unionSize = Ctx.getTypeSize(ftCanon) / 8;
+
+                auto itU = g_bound_unions.find(sName);
+                if (itU != g_bound_unions.end() && !itU->second.empty()) {
+                    FieldInfo uf;
+                    uf.name = uName;
+                    uf.type_kind = "union";
+                    uf.c_type = ft.getAsString();
+                    uf.size = unionSize;
+                    uf.counted_by = itU->second[0].tag_field;
+
+                    if (UD) {
+                        for (const auto &ub : itU->second) {
+                            for (const FieldDecl *UFD : UD->fields()) {
+                                if (UFD->getNameAsString() == ub.member_name) {
+                                    FieldInfo mInfo = resolveFieldType(UFD->getType(), ub.member_name, Ctx, depth + 1);
+                                    mInfo.array_parent = ub.tag_val_str;
+                                    mInfo.array_index = (int)ub.tag_val;
+                                    uf.struct_fields.push_back(mInfo);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    f.struct_fields.push_back(uf);
+                    continue;
+                } else {
+                    // Fallback: unannotated union is preserved as raw bytes of sizeof(union)
+                    FieldInfo uf;
+                    uf.name = uName;
+                    uf.type_kind = "bytes";
+                    uf.c_type = ft.getAsString();
+                    uf.size = unionSize;
+                    f.struct_fields.push_back(uf);
+                    continue;
+                }
+            }
+
+            if (fieldName.empty()) {
+                continue;
+            }
+
+            // Check count binding (CTRACE_COUNTED_BY or CTRACE_BIND_COUNT)
             std::string countField = getCountedByField(FD);
+            if (countField.empty() && !sName.empty()) {
+                auto itC = g_bound_counts.find({sName, fieldName});
+                if (itC != g_bound_counts.end()) {
+                    countField = itC->second;
+                }
+            }
+
             if (!countField.empty()) {
-                QualType ftCanon = ft.getCanonicalType();
                 QualType elemType;
                 if (ft->isPointerType()) {
                     elemType = ft->getPointeeType();
@@ -257,9 +334,9 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                     elemType = CAT->getElementType();
                 }
                 if (!elemType.isNull()) {
-                    FieldInfo elem = resolveFieldType(elemType, FD->getNameAsString() + "_elem", Ctx, depth + 1);
+                    FieldInfo elem = resolveFieldType(elemType, fieldName + "_elem", Ctx, depth + 1);
                     FieldInfo cf;
-                    cf.name = FD->getNameAsString();
+                    cf.name = fieldName;
                     cf.type_kind = "counted_array";
                     cf.c_type = ft.getAsString();
                     cf.counted_by = countField;
@@ -275,15 +352,15 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
             if (ft->isPointerType() && !isStringType(ft, Ctx)) {
                 continue;
             }
-            QualType ftCanon = ft.getCanonicalType();
             // Skip flexible array members without CTRACE_COUNTED_BY
             if (ftCanon->isIncompleteArrayType()) {
                 continue;
             }
-            // Skip unions or structs beyond max recursion depth inside structs
-            if (ftCanon->isUnionType() || (ftCanon->isStructureType() && depth + 1 >= 4 && !isCtraceBytesType(ft, Ctx))) {
+            if (ftCanon->isStructureType() && depth + 1 >= 4 && !isCtraceBytesType(ft, Ctx)) {
                 continue;
             }
+
+            // Fixed-size arrays
             if (const auto *CAT = Ctx.getAsConstantArrayType(ft)) {
                 QualType elemType = CAT->getElementType();
                 if (!isPlainCharType(elemType)) {
@@ -292,17 +369,34 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                         continue;
                     }
                     uint64_t arrLen = CAT->getSize().getZExtValue();
-                    for (uint64_t idx = 0; idx < arrLen; ++idx) {
-                        std::string elemName = FD->getNameAsString() + "_" + std::to_string(idx);
-                        FieldInfo sub = resolveFieldType(elemType, elemName, Ctx, depth + 1);
-                        sub.array_index = (int)idx;
-                        sub.array_parent = FD->getNameAsString();
-                        f.struct_fields.push_back(sub);
+                    if (arrLen > 4) {
+                        // Fixed array (Gap 3): preserve as contiguous array rather than flattening
+                        FieldInfo elem = resolveFieldType(elemType, fieldName + "_elem", Ctx, depth + 1);
+                        FieldInfo af;
+                        af.name = fieldName;
+                        af.type_kind = "fixed_array";
+                        af.c_type = ft.getAsString();
+                        af.size = arrLen * elem.size;
+                        af.array_index = -1;
+                        af.array_parent = std::to_string(arrLen);
+                        af.struct_fields.push_back(elem);
+                        f.struct_fields.push_back(af);
+                        continue;
+                    } else {
+                        // Small arrays (<= 4 elements) unroll for convenient scalar field access
+                        for (uint64_t idx = 0; idx < arrLen; ++idx) {
+                            std::string elemName = fieldName + "_" + std::to_string(idx);
+                            FieldInfo sub = resolveFieldType(elemType, elemName, Ctx, depth + 1);
+                            sub.array_index = (int)idx;
+                            sub.array_parent = fieldName;
+                            f.struct_fields.push_back(sub);
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
-            FieldInfo sub = resolveFieldType(ft, FD->getNameAsString(), Ctx, depth + 1);
+
+            FieldInfo sub = resolveFieldType(ft, fieldName, Ctx, depth + 1);
             f.struct_fields.push_back(sub);
         }
         return f;
@@ -457,15 +551,84 @@ private:
     ASTContext *Ctx;
 };
 
+class BindingASTVisitor : public RecursiveASTVisitor<BindingASTVisitor> {
+public:
+    explicit BindingASTVisitor(ASTContext *Context) : Ctx(Context) {}
+
+    bool VisitVarDecl(VarDecl *VD) {
+        if (!VD) return true;
+        for (const auto *A : VD->specific_attrs<AnnotateAttr>()) {
+            std::string ann = A->getAnnotation().str();
+            if (ann.rfind("ctrace:bind_count:", 0) == 0) {
+                // format: ctrace:bind_count:type:array_field:count_field
+                std::vector<std::string> parts;
+                std::stringstream ss(ann);
+                std::string item;
+                while (std::getline(ss, item, ':')) parts.push_back(item);
+                if (parts.size() >= 5) {
+                    std::string typeName = stripStructPrefix(parts[2]);
+                    g_bound_counts[{typeName, parts[3]}] = parts[4];
+                }
+            } else if (ann.rfind("ctrace:bind_union:", 0) == 0) {
+                // format: ctrace:bind_union:type:tag_field:tag_val:member_name
+                std::vector<std::string> parts;
+                std::stringstream ss(ann);
+                std::string item;
+                while (std::getline(ss, item, ':')) parts.push_back(item);
+                if (parts.size() >= 6) {
+                    std::string typeName = stripStructPrefix(parts[2]);
+                    UnionCaseBinding ub;
+                    ub.tag_field = parts[3];
+                    ub.tag_val_str = parts[4];
+                    ub.member_name = parts[5];
+                    try {
+                        ub.tag_val = std::stoll(ub.tag_val_str, nullptr, 0);
+                        ub.has_numeric_tag = true;
+                    } catch (...) {}
+                    g_bound_unions[typeName].push_back(ub);
+                }
+            } else if (ann.rfind("ctrace:bind_union_val:", 0) == 0) {
+                // evaluate integer value if available
+                if (VD->hasInit()) {
+                    Expr::EvalResult res;
+                    if (VD->getInit()->EvaluateAsInt(res, *Ctx)) {
+                        int64_t val = res.Val.getInt().getExtValue();
+                        std::vector<std::string> parts;
+                        std::stringstream ss(ann);
+                        std::string item;
+                        while (std::getline(ss, item, ':')) parts.push_back(item);
+                        if (parts.size() >= 5) {
+                            std::string typeName = stripStructPrefix(parts[2]);
+                            std::string memberName = parts[4];
+                            for (auto &ub : g_bound_unions[typeName]) {
+                                if (ub.member_name == memberName) {
+                                    ub.tag_val = val;
+                                    ub.has_numeric_tag = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+private:
+    ASTContext *Ctx;
+};
+
 class TraceASTConsumer : public ASTConsumer {
 public:
-    explicit TraceASTConsumer(ASTContext *Context) : Visitor(Context) {}
+    explicit TraceASTConsumer(ASTContext *Context) : BindingVisitor(Context), Visitor(Context) {}
 
     void HandleTranslationUnit(ASTContext &Context) override {
+        BindingVisitor.TraverseDecl(Context.getTranslationUnitDecl());
         Visitor.TraverseDecl(Context.getTranslationUnitDecl());
     }
 
 private:
+    BindingASTVisitor BindingVisitor;
     TraceASTVisitor Visitor;
 };
 
@@ -478,6 +641,19 @@ public:
 
 static llvm::cl::OptionCategory CtraceScanCategory("ctrace-scan options");
 static llvm::cl::opt<std::string> OutputFilename("o", llvm::cl::desc("Output JSON trace file"), llvm::cl::value_desc("filename"), llvm::cl::cat(CtraceScanCategory));
+static llvm::cl::opt<bool> ForceScan("force-scan", llvm::cl::desc("Force full AST scan even if file has no trace symbols"), llvm::cl::cat(CtraceScanCategory));
+
+bool fileHasTraceSymbols(const std::string &path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return true;
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (content.find("TRACE_EVENT") != std::string::npos ||
+        content.find("__ctrace_hook") != std::string::npos ||
+        content.find("CTRACE_") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
 
 json fieldInfoToJson(const FieldInfo &f) {
     json j;
@@ -514,6 +690,23 @@ json fieldInfoToJson(const FieldInfo &f) {
             subfields.push_back(fieldInfoToJson(sub));
         }
         j["struct_fields"] = subfields;
+    } else if (f.type_kind == "fixed_array") {
+        j["array_len"] = f.array_index;
+        json subfields = json::array();
+        for (const auto &sub : f.struct_fields) {
+            subfields.push_back(fieldInfoToJson(sub));
+        }
+        j["struct_fields"] = subfields;
+    } else if (f.type_kind == "union") {
+        j["tag_field"] = f.counted_by;
+        json cases = json::array();
+        for (const auto &sub : f.struct_fields) {
+            json sj = fieldInfoToJson(sub);
+            sj["tag_val"] = sub.array_index;
+            sj["tag_val_str"] = sub.array_parent;
+            cases.push_back(sj);
+        }
+        j["union_cases"] = cases;
     }
     return j;
 }
@@ -555,6 +748,41 @@ int main(int argc, const char **argv) {
     }
 
     CommonOptionsParser &OptionsParser = ExpectedParser.get();
+
+    // Fast-skip: If source file doesn't mention TRACE_EVENT or CTRACE_ or __ctrace_hook, emit empty JSON immediately
+    bool anySymbols = false;
+    if (ForceScan) {
+        anySymbols = true;
+    } else {
+        for (const auto &src : OptionsParser.getSourcePathList()) {
+            if (fileHasTraceSymbols(src)) {
+                anySymbols = true;
+                break;
+            }
+        }
+    }
+
+    if (!anySymbols && !OptionsParser.getSourcePathList().empty()) {
+        json root = json::object();
+        root["events"] = json::array();
+        std::string outPath = OutputFilename;
+        if (outPath.size() >= 2 && outPath.front() == '"' && outPath.back() == '"') {
+            outPath = outPath.substr(1, outPath.size() - 2);
+        }
+        if (!outPath.empty()) {
+            auto parent = std::filesystem::path(outPath).parent_path();
+            if (!parent.empty()) {
+                std::filesystem::create_directories(parent);
+            }
+            std::ofstream outFile(outPath);
+            if (outFile) {
+                outFile << root.dump(2) << std::endl;
+                return 0;
+            }
+        }
+        std::cout << root.dump(2) << std::endl;
+        return 0;
+    }
 
     // Extract extra-arg values passed from command line
     std::vector<std::string> extraFlags = {"-DCTRACE_AST_SCAN"};

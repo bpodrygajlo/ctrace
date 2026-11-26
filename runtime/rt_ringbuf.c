@@ -17,6 +17,10 @@
 #include <sched.h>
 #include <sys/resource.h>
 
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_shutdown_ringbuf(void);
+#endif
+
 #define CTRACE_RINGBUF_SIZE   (256 * 1024)
 #define CTRACE_MAX_EVENT_SIZE ((CTRACE_RINGBUF_SIZE / 2) - 64)
 
@@ -272,15 +276,30 @@ static void *writer_thread_func(void *arg) {
     return NULL;
 }
 
-void ctrace_init(const char *target_uri) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_init_ringbuf(const char *target_uri)
+#else
+void ctrace_init(const char *target_uri)
+#endif
+{
     ctrace_calibrate_tsc();
     if (atomic_load_explicit(&g_out_fd, memory_order_acquire) >= 0) {
+#if defined(CTRACE_MULTI_BACKEND)
+        ctrace_shutdown_ringbuf();
+#else
         ctrace_shutdown();
+#endif
     }
 
     pthread_mutex_lock(&g_lifecycle_mutex);
 
     const char *path = target_uri;
+    if (!path || strcmp(path, "") == 0) {
+        path = getenv("CTRACE_OUTPUT_PATH");
+        if (!path || strcmp(path, "") == 0) {
+            path = getenv("CTRACE_FILE");
+        }
+    }
     if (!path || strcmp(path, "") == 0) {
         path = "trace.bin";
     }
@@ -334,7 +353,12 @@ void ctrace_init(const char *target_uri) {
     pthread_mutex_unlock(&g_lifecycle_mutex);
 }
 
-void ctrace_flush(void) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_flush_ringbuf(void)
+#else
+void ctrace_flush(void)
+#endif
+{
     int fd = atomic_load_explicit(&g_out_fd, memory_order_acquire);
     if (fd >= 0) {
         drain_all_buffers(fd);
@@ -342,7 +366,12 @@ void ctrace_flush(void) {
     }
 }
 
-void ctrace_shutdown(void) {
+#if defined(CTRACE_MULTI_BACKEND)
+void ctrace_shutdown_ringbuf(void)
+#else
+void ctrace_shutdown(void)
+#endif
+{
     pthread_mutex_lock(&g_lifecycle_mutex);
     if (g_writer_tid_valid) {
         atomic_store_explicit(&g_writer_running, 0, memory_order_release);

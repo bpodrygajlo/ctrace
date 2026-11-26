@@ -122,6 +122,12 @@ void ctrace_init(const char *target_uri) {
 
     const char *path = target_uri;
     if (!path || strcmp(path, "") == 0) {
+        path = getenv("CTRACE_OUTPUT_PATH");
+        if (!path || strcmp(path, "") == 0) {
+            path = getenv("CTRACE_FILE");
+        }
+    }
+    if (!path || strcmp(path, "") == 0) {
         path = "trace.bin.zst";
     }
 
