@@ -210,7 +210,8 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
         for (auto it = ED->enumerator_begin(); it != ED->enumerator_end(); ++it) {
             EnumConstant ec;
             ec.name = it->getNameAsString();
-            ec.value = it->getInitVal().getExtValue();
+            const llvm::APSInt &val = it->getInitVal();
+            ec.value = val.isSigned() ? val.getSExtValue() : (int64_t)val.getZExtValue();
             f.enum_constants.push_back(ec);
         }
         return f;
@@ -566,7 +567,8 @@ int main(int argc, const char **argv) {
 
     int result = Tool.run(newFrontendActionFactory<TraceFrontendAction>().get());
     if (result != 0) {
-        llvm::errs() << "Warning: ClangTool returned non-zero code: " << result << "\n";
+        llvm::errs() << "ctrace-scan error: ClangTool failed with code: " << result << "\n";
+        return result;
     }
 
     json root = json::object();

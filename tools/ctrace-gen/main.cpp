@@ -81,7 +81,16 @@ bool fieldsCompatible(const Field &a, const Field &b) {
     if (a.is_signed != b.is_signed) return false;
     if (a.is_pointer != b.is_pointer) return false;
     if (a.counted_by != b.counted_by) return false;
-    if (a.type_kind == "enum" && a.enum_name != b.enum_name) return false;
+    if (a.type_kind == "enum") {
+        if (a.enum_name != b.enum_name) return false;
+        if (a.enum_constants.size() != b.enum_constants.size()) return false;
+        for (size_t i = 0; i < a.enum_constants.size(); ++i) {
+            if (a.enum_constants[i].name != b.enum_constants[i].name ||
+                a.enum_constants[i].value != b.enum_constants[i].value) {
+                return false;
+            }
+        }
+    }
     if (a.type_kind == "struct" || a.type_kind == "counted_array") {
         if (a.struct_name != b.struct_name) return false;
         if (a.struct_fields.size() != b.struct_fields.size()) return false;
@@ -669,7 +678,11 @@ int main(int argc, char **argv) {
             }
             h << ") do {" << eol;
             for (size_t i = 0; i < ev.fields.size(); ++i) {
-                h << "    __typeof__(_ctrace_a" << i << ") __ctrace_v_" << ev.fields[i].name << " = (_ctrace_a" << i << ");" << eol;
+                if (ev.fields[i].type_kind == "struct") {
+                    h << "    __typeof__(_ctrace_a" << i << ") __ctrace_v_" << ev.fields[i].name << " = (_ctrace_a" << i << ");" << eol;
+                } else {
+                    h << "    " << safeParamCType(ev.fields[i]) << " __ctrace_v_" << ev.fields[i].name << " = (_ctrace_a" << i << ");" << eol;
+                }
             }
         } else {
             h << "static inline void __ctrace_emit_" << ev.name << "(";
@@ -751,6 +764,7 @@ int main(int argc, char **argv) {
                 std::string cnt = getCountExpr(accessor, f.counted_by);
                 std::string lvar = "_i" + std::to_string(loopDepth);
                 std::string cvar = "_cnt" + std::to_string(loopDepth);
+                h << "    {" << eol;
                 if (f.is_pointer) {
                     h << "    size_t " << cvar << " = (((int64_t)(" << cnt << ") > 0) && ((const void *)(" << accessor << ") != NULL)) ? (size_t)(" << cnt << ") : 0;" << eol;
                 } else {
@@ -766,6 +780,7 @@ int main(int argc, char **argv) {
                 }
                 h << "    }" << eol;
                 h << "    fprintf(_f, \"]\");" << eol;
+                h << "    }" << eol;
             } else if (f.type_kind == "struct") {
                 std::string op = f.is_pointer ? "->" : ".";
                 if (f.is_pointer) {
@@ -1091,7 +1106,7 @@ int main(int argc, char **argv) {
                     if (!ff.struct_fields.empty() && ff.struct_fields[0].type_kind == "struct") {
                         std::string lenVar = "_len_" + ff.flat_name;
                         emitCountedArraySizeCalc(h, ff, lenVar, 0, false, eol);
-                        h << "        char *_ca_buf = (char *)malloc(4 + " << lenVar << ");" << eol;
+                        h << "        char *_ca_buf = (char *)malloc((size_t)4 + (size_t)" << lenVar << ");" << eol;
                         h << "        if (_ca_buf) {" << eol;
                         h << "            char *_p = _ca_buf;" << eol;
                         emitCountedArraySerialize(h, ff, lenVar, 0, false, eol);

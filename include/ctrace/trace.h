@@ -37,6 +37,7 @@ static inline uint64_t ctrace_now_cycles(void) {
 uint64_t ctrace_now_ns(void);
 uint64_t ctrace_get_tsc_freq(void);
 uint64_t ctrace_cycles_to_ns(uint64_t cycles);
+void ctrace_calibrate_tsc(void);
 
 #if defined(CTRACE_BACKEND_SQLITE) || defined(CTRACE_ENABLE_SQL_API)
 int ctrace_sql_exec(const char *sql, int (*cb)(void*, int, char**, char**), void *arg);

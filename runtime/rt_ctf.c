@@ -98,30 +98,36 @@ static ctrace_ctf_thread_t *get_or_create_ctf_thread(void) {
 
 // Caller must hold t->lock
 static void flush_ctf_packet_locked(ctrace_ctf_thread_t *t) {
-    int fd = atomic_load_explicit(&g_ctf_fd, memory_order_acquire);
-    if (!t || fd < 0) return;
-    if (t->offset <= sizeof(ctf_packet_header_t) || t->event_count == 0) return;
-
-    ctf_packet_header_t *hdr = (ctf_packet_header_t *)t->packet;
-    hdr->magic = CTF_MAGIC;
-    memcpy(hdr->uuid, CTF_UUID, 16);
-    hdr->stream_id = 0;
-    hdr->timestamp_begin = t->ts_begin;
-    hdr->timestamp_end = (t->ts_end >= t->ts_begin) ? t->ts_end : t->ts_begin;
-    hdr->content_size = (uint64_t)t->offset * 8;
-    hdr->packet_size = (uint64_t)CTF_PACKET_SIZE * 8;
-    hdr->events_discarded = t->discarded_count;
-    hdr->cpu_id = 0;
-
-    // Zero-fill padding
-    memset(t->packet + t->offset, 0, CTF_PACKET_SIZE - t->offset);
-
-    pthread_mutex_lock(&g_ctf_file_mutex);
-    fd = atomic_load_explicit(&g_ctf_fd, memory_order_acquire);
-    if (fd >= 0) {
-        ctf_write_all(fd, t->packet, CTF_PACKET_SIZE);
+    if (!t) return;
+    if (t->offset <= sizeof(ctf_packet_header_t) || t->event_count == 0) {
+        t->offset = sizeof(ctf_packet_header_t);
+        t->event_count = 0;
+        return;
     }
-    pthread_mutex_unlock(&g_ctf_file_mutex);
+
+    int fd = atomic_load_explicit(&g_ctf_fd, memory_order_acquire);
+    if (fd >= 0) {
+        ctf_packet_header_t *hdr = (ctf_packet_header_t *)t->packet;
+        hdr->magic = CTF_MAGIC;
+        memcpy(hdr->uuid, CTF_UUID, 16);
+        hdr->stream_id = 0;
+        hdr->timestamp_begin = t->ts_begin;
+        hdr->timestamp_end = (t->ts_end >= t->ts_begin) ? t->ts_end : t->ts_begin;
+        hdr->content_size = (uint64_t)t->offset * 8;
+        hdr->packet_size = (uint64_t)CTF_PACKET_SIZE * 8;
+        hdr->events_discarded = t->discarded_count;
+        hdr->cpu_id = 0;
+
+        // Zero-fill padding
+        memset(t->packet + t->offset, 0, CTF_PACKET_SIZE - t->offset);
+
+        pthread_mutex_lock(&g_ctf_file_mutex);
+        fd = atomic_load_explicit(&g_ctf_fd, memory_order_acquire);
+        if (fd >= 0) {
+            ctf_write_all(fd, t->packet, CTF_PACKET_SIZE);
+        }
+        pthread_mutex_unlock(&g_ctf_file_mutex);
+    }
 
     t->offset = sizeof(ctf_packet_header_t);
     t->ts_begin = 0;
@@ -130,6 +136,9 @@ static void flush_ctf_packet_locked(ctrace_ctf_thread_t *t) {
 }
 
 void *ctrace_ctf_reserve(size_t len) {
+    if (atomic_load_explicit(&g_ctf_fd, memory_order_acquire) < 0) {
+        return NULL;
+    }
     ctrace_ctf_thread_t *t = get_or_create_ctf_thread();
     if (!t || len == 0) {
         return NULL;
@@ -168,6 +177,7 @@ void ctrace_ctf_commit(void *ptr, size_t len) {
 }
 
 void ctrace_init(const char *target_uri) {
+    ctrace_calibrate_tsc();
     if (atomic_load_explicit(&g_ctf_fd, memory_order_acquire) >= 0) {
         ctrace_shutdown();
     }

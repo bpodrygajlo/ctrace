@@ -87,6 +87,7 @@ void ctrace_sqlite_step_done(void) {
 }
 
 void ctrace_init(const char *target_uri) {
+    ctrace_calibrate_tsc();
     pthread_mutex_lock(&g_sqlite_mutex);
 
     close_sqlite_db_locked();

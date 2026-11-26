@@ -69,26 +69,30 @@ static ctrace_zstd_thread_t *get_or_create_zstd_thread(void) {
 
 // Caller must hold t->lock
 static void flush_thread_chunk_locked(ctrace_zstd_thread_t *t) {
+    if (!t || t->raw_len == 0) return;
     int fd = atomic_load_explicit(&g_zstd_fd, memory_order_acquire);
-    if (!t || t->raw_len == 0 || fd < 0 || !t->cctx) return;
+    if (fd >= 0 && t->cctx) {
+        size_t max_comp = ZSTD_COMPRESSBOUND(CTRACE_ZSTD_CHUNK_SIZE);
+        size_t c_size = ZSTD_compressCCtx(t->cctx, t->comp_buf + 4, max_comp, t->raw_buf, t->raw_len, 1);
+        if (!ZSTD_isError(c_size)) {
+            uint32_t c_len = (uint32_t)c_size;
+            memcpy(t->comp_buf, &c_len, 4);
 
-    size_t max_comp = ZSTD_COMPRESSBOUND(CTRACE_ZSTD_CHUNK_SIZE);
-    size_t c_size = ZSTD_compressCCtx(t->cctx, t->comp_buf + 4, max_comp, t->raw_buf, t->raw_len, 1);
-    if (!ZSTD_isError(c_size)) {
-        uint32_t c_len = (uint32_t)c_size;
-        memcpy(t->comp_buf, &c_len, 4);
-
-        pthread_mutex_lock(&g_zstd_file_mutex);
-        fd = atomic_load_explicit(&g_zstd_fd, memory_order_acquire);
-        if (fd >= 0) {
-            zstd_write_all(fd, t->comp_buf, 4 + c_size);
+            pthread_mutex_lock(&g_zstd_file_mutex);
+            fd = atomic_load_explicit(&g_zstd_fd, memory_order_acquire);
+            if (fd >= 0) {
+                zstd_write_all(fd, t->comp_buf, 4 + c_size);
+            }
+            pthread_mutex_unlock(&g_zstd_file_mutex);
         }
-        pthread_mutex_unlock(&g_zstd_file_mutex);
     }
     t->raw_len = 0;
 }
 
 void *ctrace_bin_reserve(size_t len) {
+    if (atomic_load_explicit(&g_zstd_fd, memory_order_acquire) < 0) {
+        return NULL;
+    }
     ctrace_zstd_thread_t *t = get_or_create_zstd_thread();
     if (!t || len == 0 || len > CTRACE_ZSTD_CHUNK_SIZE) {
         return NULL;
@@ -111,6 +115,7 @@ void ctrace_bin_commit(void *ptr, size_t len) {
 }
 
 void ctrace_init(const char *target_uri) {
+    ctrace_calibrate_tsc();
     if (atomic_load_explicit(&g_zstd_fd, memory_order_acquire) >= 0) {
         ctrace_shutdown();
     }

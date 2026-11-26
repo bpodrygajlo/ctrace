@@ -273,6 +273,7 @@ static void *writer_thread_func(void *arg) {
 }
 
 void ctrace_init(const char *target_uri) {
+    ctrace_calibrate_tsc();
     if (atomic_load_explicit(&g_out_fd, memory_order_acquire) >= 0) {
         ctrace_shutdown();
     }
