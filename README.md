@@ -1,6 +1,6 @@
 # `ctrace` — AST-Driven Zero-Boilerplate Tracing System for C
 
-[![CI](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
+[![CI](https://github.com/bpodrygajlo/ctrace/actions/workflows/ci.yml/badge.svg)](https://github.com/bpodrygajlo/ctrace/actions/workflows/ci.yml)
 [![Standard](https://img.shields.io/badge/C-C11%20%2F%20C17%20%2F%20C23-blue.svg)]()
 [![Tooling](https://img.shields.io/badge/LLVM%2FClang-17%20%7C%2018-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)]()
