@@ -51,6 +51,35 @@ def main():
     dyn_u = next(f for f in dyn_struct["fields"] if f["type"] == "union")
     assert len(dyn_u["union_cases"]) == 2
 
+    # Negative and large unsigned tag values must survive into the schema
+    res_ev = next(e for e in schema["events"] if e["name"] == "fapi_result_event")
+    res_u = next(f for f in res_ev["fields"][0]["fields"] if f["type"] == "union")
+    assert sorted(c["tag_val"] for c in res_u["union_cases"]) == [-1, 0], res_u["union_cases"]
+    big_ev = next(e for e in schema["events"] if e["name"] == "fapi_big_tag_event")
+    big_u = next(f for f in big_ev["fields"][0]["fields"] if f["type"] == "union")
+    assert sorted(c["tag_val"] for c in big_u["union_cases"]) == [7, 0xFFFFFFFF], big_u["union_cases"]
+
+    # Two unions in one struct keep their own tag field and cases
+    two_ev = next(e for e in schema["events"] if e["name"] == "fapi_two_unions_event")
+    two_fields = two_ev["fields"][0]["fields"]
+    u1 = next(f for f in two_fields if f["name"] == "u1")
+    u2 = next(f for f in two_fields if f["name"] == "u2")
+    assert u1["tag_field"] == "t1" and sorted(c["name"] for c in u1["union_cases"]) == ["a", "b"], u1
+    assert u2["tag_field"] == "t2" and sorted(c["name"] for c in u2["union_cases"]) == ["c", "d"], u2
+
+    # A bare union pointer argument is a pointer-typed union field
+    word_ev = next(e for e in schema["events"] if e["name"] == "fapi_word_event")
+    assert word_ev["fields"][0]["type"] == "union" and word_ev["fields"][0].get("is_pointer") is True
+
+    # A directly passed fixed array is a fixed_array of its element type
+    samp_ev = next(e for e in schema["events"] if e["name"] == "fapi_samples_event")
+    samp = samp_ev["fields"][0]
+    assert samp["type"] == "fixed_array" and samp["size"] == 12 and samp["fields"][0]["type"] == "uint16", samp
+
+    # Anonymous struct members are spliced into the parent
+    anon_ev = next(e for e in schema["events"] if e["name"] == "fapi_anon_struct_event")
+    assert [f["name"] for f in anon_ev["fields"][0]["fields"]] == ["id", "x", "y"], anon_ev
+
     # 2. Decode binary stream
     if decode_tool.endswith(".py"):
         cmd = [sys.executable, decode_tool, schema_path, bin_path]
@@ -96,6 +125,52 @@ def main():
     assert "'rnti': 4660" in out
     assert "'cce': [5, 9]" in out
     assert "'ta_val': 31" in out
+
+    lines = out.splitlines()
+
+    def event_lines(name):
+        return [l for l in lines if f" {name} " in l]
+
+    # Unbound union (pthread_mutex_t) is dumped as zero bytes of sizeof(pthread_mutex_t)
+    raw_line = event_lines("fapi_raw_event")[0]
+    m_val = raw_line.split("wm_m=")[1].split()[0]
+    assert len(m_val) >= 2 * 24 and set(m_val) == {"0"}, raw_line
+
+    # Unmatched tag falls back to the raw union bytes (tti=0x11223344, little-endian).
+    # Field names come from the first call site, so every fapi_pdu_event is named pdu1_*.
+    pdu4_line = [l for l in event_lines("fapi_pdu_event") if "pdu1_pdu_type=99" in l][0]
+    assert "pdu1_u=4433221100000000" in pdu4_line, pdu4_line
+
+    # Negative tag selects the error variant
+    assert "'err': {'code': -22}" in event_lines("fapi_result_event")[0]
+
+    # Large unsigned tag selects its variant
+    assert "'a': {'a': 200}" in event_lines("fapi_big_tag_event")[0]
+
+    # Each union follows its own tag
+    two_line = event_lines("fapi_two_unions_event")[0]
+    assert "two_u1={'b': {'b1': 70000}}" in two_line, two_line
+    assert "two_u2={'c': {'c1': 9}}" in two_line, two_line
+
+    # Nested struct inside a variant is flattened identically by both decoders
+    nested_line = event_lines("fapi_nested_event")[0]
+    assert "nested_u={'nv': {'hdr_x': 3, 'hdr_y': 4, 'body': 500}}" in nested_line, nested_line
+
+    # Union by pointer dumps the pointee bytes; NULL dumps nothing
+    word_lines = event_lines("fapi_word_event")
+    assert any("wp=01020304" in l for l in word_lines), word_lines
+    assert any(l.rstrip().endswith("wp=") for l in word_lines), word_lines
+
+    # Two bools per counted struct element
+    flags_line = event_lines("fapi_flags_event")[0]
+    assert "fl_flags=[{'on': True, 'err': False, 'lvl': 1}, {'on': False, 'err': True, 'lvl': 2}]" in flags_line, flags_line
+
+    # Directly passed fixed array
+    assert "samples=[1, 2, 3, 4, 5, 6]" in event_lines("fapi_samples_event")[0]
+
+    # Anonymous struct members
+    anon_line = event_lines("fapi_anon_struct_event")[0]
+    assert "as_id=12 as_x=7 as_y=9" in anon_line, anon_line
 
     print("All FAPI union, fixed-array, and dynamic count binding assertions PASSED!")
 

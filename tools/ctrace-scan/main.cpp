@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <map>
@@ -45,6 +46,11 @@ struct FieldInfo {
     int array_index = -1;
     std::string array_parent;
     std::string counted_by;
+
+    // For union cases: the discriminator value selecting this member
+    int64_t tag_val = 0;
+    bool has_tag_val = false;
+    std::string tag_val_str;
 
     // For enums
     std::string enum_name;
@@ -288,57 +294,77 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                 std::string uName = isAnon ? "u" : fieldName;
                 uint64_t unionSize = Ctx.getTypeSize(ftCanon) / 8;
 
-                const std::vector<UnionCaseBinding> *pBindings = nullptr;
-                auto itURD = g_bound_unions_by_rd.find(RD);
-                if (itURD != g_bound_unions_by_rd.end() && !itURD->second.empty()) {
-                    pBindings = &itURD->second;
-                } else {
-                    auto itU = g_bound_unions.find(sName);
-                    if (itU != g_bound_unions.end() && !itU->second.empty()) {
-                        pBindings = &itU->second;
+                // Collect the bindings that name a member of THIS union. A struct may hold
+                // several unions with different tag fields, so bindings are matched per union
+                // instead of per enclosing struct.
+                std::vector<UnionCaseBinding> bindings;
+                {
+                    const std::vector<UnionCaseBinding> *pAll = nullptr;
+                    auto itURD = g_bound_unions_by_rd.find(RD);
+                    if (itURD != g_bound_unions_by_rd.end() && !itURD->second.empty()) {
+                        pAll = &itURD->second;
+                    } else {
+                        auto itU = g_bound_unions.find(sName);
+                        if (itU != g_bound_unions.end() && !itU->second.empty()) {
+                            pAll = &itU->second;
+                        }
                     }
-                }
-
-                if (pBindings && !pBindings->empty()) {
-                    FieldInfo uf;
-                    uf.name = uName;
-                    uf.is_anonymous = isAnon;
-                    uf.first_member_name = firstMember;
-                    uf.type_kind = "union";
-                    uf.c_type = ft.getAsString();
-                    uf.size = unionSize;
-                    uf.counted_by = (*pBindings)[0].tag_field;
-
-                    if (UD) {
-                        for (const auto &ub : *pBindings) {
+                    if (pAll && UD) {
+                        for (const auto &ub : *pAll) {
                             for (const FieldDecl *UFD : UD->fields()) {
                                 if (UFD->getNameAsString() == ub.member_name) {
-                                    FieldInfo mInfo = resolveFieldType(UFD->getType(), ub.member_name, Ctx, depth + 1);
-                                    mInfo.array_parent = ub.tag_val_str;
-                                    mInfo.array_index = (int)ub.tag_val;
-                                    uf.struct_fields.push_back(mInfo);
+                                    bindings.push_back(ub);
                                     break;
                                 }
                             }
                         }
                     }
-                    f.struct_fields.push_back(uf);
-                    continue;
-                } else {
-                    // Fallback: unannotated union is preserved as raw bytes of sizeof(union)
-                    FieldInfo uf;
-                    uf.name = uName;
-                    uf.is_anonymous = isAnon;
-                    uf.first_member_name = firstMember;
-                    uf.type_kind = "union";
-                    uf.c_type = ft.getAsString();
-                    uf.size = unionSize;
-                    f.struct_fields.push_back(uf);
-                    continue;
                 }
+
+                FieldInfo uf;
+                uf.name = uName;
+                uf.is_anonymous = isAnon;
+                uf.first_member_name = firstMember;
+                uf.type_kind = "union";
+                uf.c_type = ft.getAsString();
+                uf.size = unionSize;
+
+                if (!bindings.empty()) {
+                    uf.counted_by = bindings[0].tag_field;
+                    for (const auto &ub : bindings) {
+                        if (ub.tag_field != uf.counted_by) {
+                            llvm::errs() << "ctrace-scan warning: union '" << uName << "' in '" << sName
+                                         << "' is bound through several tag fields ('" << uf.counted_by
+                                         << "' and '" << ub.tag_field << "'); case '" << ub.member_name
+                                         << "' is ignored\n";
+                            continue;
+                        }
+                        for (const FieldDecl *UFD : UD->fields()) {
+                            if (UFD->getNameAsString() == ub.member_name) {
+                                FieldInfo mInfo = resolveFieldType(UFD->getType(), ub.member_name, Ctx, depth + 1);
+                                mInfo.tag_val = ub.tag_val;
+                                mInfo.has_tag_val = ub.has_numeric_tag;
+                                mInfo.tag_val_str = ub.tag_val_str;
+                                uf.struct_fields.push_back(mInfo);
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Without bindings the union is preserved as raw bytes of sizeof(union)
+                f.struct_fields.push_back(uf);
+                continue;
             }
 
             if (fieldName.empty()) {
+                // C11 anonymous struct member: its fields are accessed directly on the parent,
+                // so they are spliced into the parent's field list.
+                if (ftCanon->isStructureType() && depth + 1 < 4) {
+                    FieldInfo anon = resolveFieldType(ft, "", Ctx, depth + 1);
+                    for (auto &sub : anon.struct_fields) {
+                        f.struct_fields.push_back(sub);
+                    }
+                }
                 continue;
             }
 
@@ -370,6 +396,9 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                 } else if (ftCanon->isConstantArrayType()) {
                     const auto *CAT = Ctx.getAsConstantArrayType(ftCanon);
                     elemType = CAT->getElementType();
+                }
+                if (!elemType.isNull() && elemType->isStructureType() && depth + 1 >= 4) {
+                    continue; // element struct nests too deep to describe
                 }
                 if (!elemType.isNull()) {
                     FieldInfo elem = resolveFieldType(elemType, fieldName + "_elem", Ctx, depth + 1);
@@ -404,6 +433,9 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                 if (!isPlainCharType(elemType)) {
                     // Skip multi-dimensional arrays inside structs
                     if (elemType->isArrayType() || elemType->isUnionType()) {
+                        continue;
+                    }
+                    if (elemType->isStructureType() && depth + 1 >= 4) {
                         continue;
                     }
                     uint64_t arrLen = CAT->getSize().getZExtValue();
@@ -507,6 +539,26 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
         f.c_type = qualType.getAsString();
         f.size = Ctx.getTypeSize(canon) / 8;
         return f;
+    }
+
+    // Fixed-size array of scalars passed directly (e.g. TRACE_EVENT(ev, samples) with
+    // int samples[8]); the argument decays to a pointer to its first element.
+    if (const auto *CAT = Ctx.getAsConstantArrayType(qualType)) {
+        QualType elemType = CAT->getElementType();
+        QualType elemCanon = elemType.getCanonicalType();
+        bool scalarElem = elemCanon->isIntegerType() || elemCanon->isRealFloatingType() ||
+                          elemCanon->isBooleanType() || elemCanon->isEnumeralType();
+        if (scalarElem && !elemCanon->isPointerType()) {
+            FieldInfo elem = resolveFieldType(elemType, name + "_elem", Ctx, depth + 1);
+            uint64_t arrLen = CAT->getSize().getZExtValue();
+            f.type_kind = "fixed_array";
+            f.c_type = "const void *";
+            f.is_pointer = true;
+            f.size = arrLen * elem.size;
+            f.array_parent = std::to_string(arrLen);
+            f.struct_fields.push_back(elem);
+            return f;
+        }
     }
 
     // Generic fallback
@@ -791,8 +843,10 @@ json fieldInfoToJson(const FieldInfo &f) {
         json cases = json::array();
         for (const auto &sub : f.struct_fields) {
             json sj = fieldInfoToJson(sub);
-            sj["tag_val"] = sub.array_index;
-            sj["tag_val_str"] = sub.array_parent;
+            if (sub.has_tag_val) {
+                sj["tag_val"] = sub.tag_val;
+            }
+            sj["tag_val_str"] = sub.tag_val_str;
             cases.push_back(sj);
         }
         j["union_cases"] = cases;

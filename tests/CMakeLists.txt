@@ -79,6 +79,11 @@ if(BABELTRACE2_EXEC)
         COMMAND ${BABELTRACE2_EXEC} test_ctf_trace
     )
     set_tests_properties(test_ctf_babeltrace PROPERTIES DEPENDS test_ctf)
+    add_test(NAME test_ctf_verify
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/verify_ctf.py
+                ${BABELTRACE2_EXEC} test_ctf_trace
+    )
+    set_tests_properties(test_ctf_verify PROPERTIES DEPENDS test_ctf)
 endif()
 
 # Test 7: Complex types (deeply nested structs, fixed-size arrays, struct pointers)
@@ -148,6 +153,12 @@ add_test(NAME test_fapi_verify_cpp
             $<TARGET_FILE:ctrace-decode>
 )
 set_tests_properties(test_fapi_verify_cpp PROPERTIES DEPENDS test_fapi)
+
+# Test 11b: Discriminated unions, union pointers and anonymous members on the stdout backend
+add_executable(test_unions_stdout test_unions_stdout.c)
+target_include_directories(test_unions_stdout PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_enable_ctrace(test_unions_stdout BACKEND stdout)
+add_test(NAME test_unions_stdout COMMAND test_unions_stdout)
 
 # Test 12: Runtime multi-backend selection via CTRACE_BACKEND env var
 add_executable(test_runtime test_runtime.c)

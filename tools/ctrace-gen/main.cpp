@@ -32,6 +32,11 @@ struct Field {
     uint64_t array_len = 0;
     std::string tag_field;
 
+    // For union cases: the discriminator value selecting this member
+    int64_t tag_val = 0;
+    bool has_tag_val = false;
+    std::string tag_val_str;
+
     std::string enum_name;
     std::vector<EnumConstant> enum_constants;
 
@@ -66,11 +71,10 @@ void parseField(const json &jf, Field &f) {
     f.first_member_name = jf.value("first_member_name", "");
 
     if (jf.contains("tag_val")) {
-        f.array_index = jf.value("tag_val", f.array_index);
+        f.tag_val = jf.value("tag_val", 0LL);
+        f.has_tag_val = true;
     }
-    if (jf.contains("tag_val_str")) {
-        f.array_parent = jf.value("tag_val_str", f.array_parent);
-    }
+    f.tag_val_str = jf.value("tag_val_str", "");
 
     if (jf.contains("enum_name")) {
         f.enum_name = jf.value("enum_name", "");
@@ -115,8 +119,12 @@ bool fieldsCompatible(const Field &a, const Field &b) {
             }
         }
     }
-    if (a.type_kind == "struct" || a.type_kind == "counted_array") {
+    if (a.type_kind == "struct" || a.type_kind == "counted_array" ||
+        a.type_kind == "fixed_array" || a.type_kind == "union") {
         if (a.struct_name != b.struct_name) return false;
+        if (a.array_len != b.array_len) return false;
+        if (a.tag_field != b.tag_field) return false;
+        if (a.has_tag_val != b.has_tag_val || a.tag_val != b.tag_val) return false;
         if (a.struct_fields.size() != b.struct_fields.size()) return false;
         for (size_t i = 0; i < a.struct_fields.size(); ++i) {
             if (!fieldsCompatible(a.struct_fields[i], b.struct_fields[i])) return false;
@@ -243,6 +251,9 @@ std::string safeParamCType(const Field &f) {
     if (f.type_kind == "bytes") {
         return "ctrace_bytes_t";
     }
+    if (f.type_kind == "fixed_array") {
+        return "const void *"; // a directly passed array decays to a pointer
+    }
     if (f.is_pointer && f.type_kind != "struct") {
         return "const void *";
     }
@@ -272,8 +283,12 @@ json schemaFieldToJson(const Field &f) {
     if (f.array_index >= 0) {
         j["array_index"] = f.array_index;
         j["array_parent"] = f.array_parent;
-        j["tag_val"] = f.array_index;
-        j["tag_val_str"] = f.array_parent;
+    }
+    if (f.has_tag_val) {
+        j["tag_val"] = f.tag_val;
+    }
+    if (!f.tag_val_str.empty()) {
+        j["tag_val_str"] = f.tag_val_str;
     }
     if (f.type_kind == "enum") {
         j["enum_name"] = f.enum_name;
@@ -308,6 +323,18 @@ json schemaFieldToJson(const Field &f) {
         j["union_cases"] = cases;
     }
     return j;
+}
+
+// TSDL keywords cannot be used as field names; babeltrace strips one leading
+// underscore when displaying a field, so prefixing keeps the visible name intact.
+std::string tsdlFieldName(const std::string &name) {
+    static const std::set<std::string> reserved = {
+        "align", "callsite", "const", "char", "clock", "double", "enum", "env", "event",
+        "floating_point", "float", "integer", "int", "long", "short", "signed", "stream",
+        "string", "struct", "trace", "typealias", "typedef", "unsigned", "variant", "void",
+        "_Bool", "_Complex", "_Imaginary"};
+    if (reserved.count(name)) return "_" + name;
+    return name;
 }
 
 std::string generateCtfTsdl(const std::map<std::string, Event> &events) {
@@ -380,7 +407,9 @@ std::string generateCtfTsdl(const std::map<std::string, Event> &events) {
         m << "    fields := struct {\n";
 
         std::vector<FlatField> flatList = flattenEventFields(ev.fields);
-        for (const auto &ff : flatList) {
+        for (const auto &ffRaw : flatList) {
+            FlatField ff = ffRaw;
+            ff.flat_name = tsdlFieldName(ff.flat_name);
             if (ff.type_kind == "string") {
                 m << "        string " << ff.flat_name << ";\n";
             } else if (ff.type_kind == "bytes" || ff.type_kind == "counted_array" || ff.type_kind == "union") {
@@ -449,8 +478,46 @@ static std::string getVariantAccessor(const FlatField &ff, const std::string &me
     }
 }
 
+// Address of the union's storage. A union passed by pointer is already an address;
+// taking '&' of the pointer variable would copy the pointer (and stack) instead.
 static std::string getUnionRawPointer(const FlatField &ff) {
+    if (ff.is_pointer) {
+        return "(const void *)(" + ff.accessor_expr + ")";
+    }
     return "(const void *)(&(" + ff.accessor_expr + "))";
+}
+
+// Byte count of the raw union dump; a NULL union pointer contributes nothing.
+static std::string getUnionRawLen(const FlatField &ff) {
+    if (ff.is_pointer) {
+        return "((" + ff.accessor_expr + ") ? " + std::to_string(ff.size) + "U : 0U)";
+    }
+    return std::to_string(ff.size) + "U";
+}
+
+// Union cases grouped by member: several tag values may select the same member.
+struct UnionCaseGroup {
+    std::string member;
+    std::vector<int64_t> tags;
+    Field field;
+};
+
+static std::vector<UnionCaseGroup> groupUnionCases(const std::vector<Field> &cases) {
+    std::vector<UnionCaseGroup> groups;
+    for (const auto &c : cases) {
+        if (!c.has_tag_val) {
+            std::cerr << "ctrace-gen warning: union case '" << c.name << "' has no numeric tag value ('"
+                      << c.tag_val_str << "'); it is ignored\n";
+            continue;
+        }
+        auto it = std::find_if(groups.begin(), groups.end(), [&](const UnionCaseGroup &g) { return g.member == c.name; });
+        if (it == groups.end()) {
+            groups.push_back({c.name, {c.tag_val}, c});
+        } else {
+            it->tags.push_back(c.tag_val);
+        }
+    }
+    return groups;
 }
 
 void emitCountedArraySizeCalc(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol);
@@ -529,9 +596,7 @@ void emitFlatListSerialize(std::ostringstream &h, const std::vector<FlatField> &
             std::string blVar = "_bl_" + sf.flat_name + "_" + std::to_string(depth);
             h << "        uint32_t " << blVar << " = ((" << sf.accessor_expr << ").ptr && (" << sf.accessor_expr << ").len > 0) ? (uint32_t)(" << sf.accessor_expr << ").len : 0U;" << eol;
             h << "        memcpy(_p, &" << blVar << ", 4); _p += 4;" << eol;
-            if (!isCtf) {
-                h << "        if (" << blVar << " > 0) { memcpy(_p, (" << sf.accessor_expr << ").ptr, " << blVar << "); _p += " << blVar << "; }" << eol;
-            }
+            h << "        if (" << blVar << " > 0) { memcpy(_p, (" << sf.accessor_expr << ").ptr, " << blVar << "); _p += " << blVar << "; }" << eol;
         } else if (sf.type_kind == "counted_array") {
             std::string subLenVar = "_sublen_" + sf.flat_name + "_" + std::to_string(depth + 1);
             emitCountedArraySizeCalc(h, sf, subLenVar, depth + 1, isCtf, eol);
@@ -541,9 +606,9 @@ void emitFlatListSerialize(std::ostringstream &h, const std::vector<FlatField> &
             emitUnionSizeCalc(h, sf, subLenVar, depth + 1, isCtf, eol);
             emitUnionSerialize(h, sf, subLenVar, depth + 1, isCtf, eol);
         } else if (sf.type_kind == "bool") {
-            h << "        uint8_t _bv = (" << sf.accessor_expr << ") ? 1 : 0; memcpy(_p, &_bv, 1); _p += 1;" << eol;
+            h << "        { uint8_t _bv = (" << sf.accessor_expr << ") ? 1 : 0; memcpy(_p, &_bv, 1); _p += 1; }" << eol;
         } else if (isCtf && sf.type_kind == "enum") {
-            h << "        int32_t _ev = (int32_t)(" << sf.accessor_expr << "); memcpy(_p, &_ev, 4); _p += 4;" << eol;
+            h << "        { int32_t _ev = (int32_t)(" << sf.accessor_expr << "); memcpy(_p, &_ev, 4); _p += 4; }" << eol;
         } else if (sf.type_kind == "fixed_array") {
             h << "        memcpy(_p, (const void *)(" << sf.accessor_expr << "), " << sf.size << "); _p += " << sf.size << ";" << eol;
         } else if (sf.is_pointer) {
@@ -576,38 +641,28 @@ void emitCountedArraySerialize(std::ostringstream &h, const FlatField &ff, const
 
 void emitUnionSizeCalc(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol) {
     h << "    uint32_t " << lenVar << " = 0;" << eol;
-    if (ff.struct_fields.empty() || ff.tag_field.empty()) {
-        h << "    " << lenVar << " = " << ff.size << "U;" << eol;
+    std::vector<UnionCaseGroup> groups = ff.tag_field.empty() ? std::vector<UnionCaseGroup>{} : groupUnionCases(ff.struct_fields);
+    if (groups.empty()) {
+        h << "    " << lenVar << " = " << getUnionRawLen(ff) << ";" << eol;
         return;
     }
     std::string tagExpr = getCountExpr(ff.accessor_expr, ff.tag_field);
 
-    std::vector<std::string> memberNames;
-    std::map<std::string, std::vector<int64_t>> tagsByMember;
-    std::map<std::string, Field> fieldByMember;
-    for (const auto &c : ff.struct_fields) {
-        if (tagsByMember.find(c.name) == tagsByMember.end()) {
-            memberNames.push_back(c.name);
-            fieldByMember[c.name] = c;
-        }
-        tagsByMember[c.name].push_back(c.array_index);
-    }
-
     h << "    switch ((int64_t)(" << tagExpr << ")) {" << eol;
-    for (const auto &mName : memberNames) {
-        for (auto t : tagsByMember[mName]) {
-            h << "        case " << t << ":" << eol;
+    for (const auto &g : groups) {
+        for (auto t : g.tags) {
+            h << "        case " << t << "LL:" << eol;
         }
         h << "        {" << eol;
-        std::string varAcc = getVariantAccessor(ff, mName);
+        std::string varAcc = getVariantAccessor(ff, g.member);
         std::vector<FlatField> varFlat;
-        flattenFieldInternal(fieldByMember[mName], ff.flat_name + "_" + mName, varAcc, varFlat);
+        flattenFieldInternal(g.field, ff.flat_name + "_" + g.member, varAcc, varFlat);
         emitFlatListSizeCalc(h, varFlat, lenVar, depth + 1, isCtf, eol);
         h << "            break;" << eol;
         h << "        }" << eol;
     }
     h << "        default: {" << eol;
-    h << "            " << lenVar << " = " << ff.size << "U;" << eol;
+    h << "            " << lenVar << " = " << getUnionRawLen(ff) << ";" << eol;
     h << "            break;" << eol;
     h << "        }" << eol;
     h << "    }" << eol;
@@ -615,32 +670,22 @@ void emitUnionSizeCalc(std::ostringstream &h, const FlatField &ff, const std::st
 
 void emitUnionSerialize(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol) {
     h << "    memcpy(_p, &" << lenVar << ", 4); _p += 4;" << eol;
-    if (ff.struct_fields.empty() || ff.tag_field.empty()) {
+    std::vector<UnionCaseGroup> groups = ff.tag_field.empty() ? std::vector<UnionCaseGroup>{} : groupUnionCases(ff.struct_fields);
+    if (groups.empty()) {
         h << "    if (" << lenVar << " > 0) { memcpy(_p, " << getUnionRawPointer(ff) << ", " << lenVar << "); _p += " << lenVar << "; }" << eol;
         return;
     }
     std::string tagExpr = getCountExpr(ff.accessor_expr, ff.tag_field);
 
-    std::vector<std::string> memberNames;
-    std::map<std::string, std::vector<int64_t>> tagsByMember;
-    std::map<std::string, Field> fieldByMember;
-    for (const auto &c : ff.struct_fields) {
-        if (tagsByMember.find(c.name) == tagsByMember.end()) {
-            memberNames.push_back(c.name);
-            fieldByMember[c.name] = c;
-        }
-        tagsByMember[c.name].push_back(c.array_index);
-    }
-
     h << "    switch ((int64_t)(" << tagExpr << ")) {" << eol;
-    for (const auto &mName : memberNames) {
-        for (auto t : tagsByMember[mName]) {
-            h << "        case " << t << ":" << eol;
+    for (const auto &g : groups) {
+        for (auto t : g.tags) {
+            h << "        case " << t << "LL:" << eol;
         }
         h << "        {" << eol;
-        std::string varAcc = getVariantAccessor(ff, mName);
+        std::string varAcc = getVariantAccessor(ff, g.member);
         std::vector<FlatField> varFlat;
-        flattenFieldInternal(fieldByMember[mName], ff.flat_name + "_" + mName, varAcc, varFlat);
+        flattenFieldInternal(g.field, ff.flat_name + "_" + g.member, varAcc, varFlat);
         emitFlatListSerialize(h, varFlat, depth + 1, isCtf, eol);
         h << "            break;" << eol;
         h << "        }" << eol;
@@ -993,6 +1038,8 @@ int main(int argc, char **argv) {
                 std::string subAccessor;
                 if (sub.array_index >= 0) {
                     subAccessor = "(" + accessor + ")" + op + sub.array_parent + "[" + std::to_string(sub.array_index) + "]";
+                } else if (sub.is_anonymous && !sub.first_member_name.empty()) {
+                    subAccessor = "(" + accessor + ")" + op + sub.first_member_name;
                 } else {
                     subAccessor = "(" + accessor + ")" + op + sub.name;
                 }
@@ -1013,12 +1060,53 @@ int main(int argc, char **argv) {
             if ((size_t)f.size > 16) h << "    __ctrace_buf_append(&_p, &_rem, \"...\");" << eol;
             h << "    __ctrace_buf_append(&_p, &_rem, \"]\");" << eol;
         } else if (f.type_kind == "union") {
-            h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "[union_len=%\" PRIu64 \",hex=\", (uint64_t)" << f.size << ");" << eol;
-            h << "    for (size_t _i = 0; _i < (size_t)" << f.size << " && _i < 16; ++_i) {" << eol;
-            h << "        __ctrace_buf_append(&_p, &_rem, \"%02x\", ((const unsigned char *)(&(" << accessor << ")))[_i]);" << eol;
-            h << "    }" << eol;
-            if ((size_t)f.size > 16) h << "    __ctrace_buf_append(&_p, &_rem, \"...\");" << eol;
-            h << "    __ctrace_buf_append(&_p, &_rem, \"]\");" << eol;
+            // Address of the union storage; an anonymous union is reached through its first member
+            std::string rawPtr = f.is_pointer ? "(const unsigned char *)(" + accessor + ")"
+                                              : "(const unsigned char *)(&(" + accessor + "))";
+            auto emitRawHex = [&](const std::string &indent) {
+                if (f.is_pointer) {
+                    h << indent << "if (!(" << accessor << ")) { __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "(null)\"); } else {" << eol;
+                }
+                h << indent << "__ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "[union_len=%\" PRIu64 \",hex=\", (uint64_t)" << f.size << ");" << eol;
+                h << indent << "for (size_t _i = 0; _i < (size_t)" << f.size << " && _i < 16; ++_i) {" << eol;
+                h << indent << "    __ctrace_buf_append(&_p, &_rem, \"%02x\", (" << rawPtr << ")[_i]);" << eol;
+                h << indent << "}" << eol;
+                if ((size_t)f.size > 16) h << indent << "__ctrace_buf_append(&_p, &_rem, \"...\");" << eol;
+                h << indent << "__ctrace_buf_append(&_p, &_rem, \"]\");" << eol;
+                if (f.is_pointer) {
+                    h << indent << "}" << eol;
+                }
+            };
+            std::vector<UnionCaseGroup> groups = f.tag_field.empty() ? std::vector<UnionCaseGroup>{} : groupUnionCases(f.struct_fields);
+            if (groups.empty()) {
+                emitRawHex("    ");
+            } else {
+                std::string tagExpr = getCountExpr(accessor, f.tag_field);
+                h << "    switch ((int64_t)(" << tagExpr << ")) {" << eol;
+                for (const auto &g : groups) {
+                    for (auto t : g.tags) {
+                        h << "        case " << t << "LL:" << eol;
+                    }
+                    h << "        {" << eol;
+                    std::string varAcc;
+                    if (f.is_anonymous && !f.first_member_name.empty()) {
+                        size_t pos = accessor.rfind(f.first_member_name);
+                        varAcc = (pos != std::string::npos) ? accessor.substr(0, pos) + g.member : accessor;
+                    } else {
+                        varAcc = "(" + accessor + ")." + g.member;
+                    }
+                    h << "        __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "{\");" << eol;
+                    self(self, g.field, varAcc, false, false, loopDepth, eol);
+                    h << "        __ctrace_buf_append(&_p, &_rem, \"}\");" << eol;
+                    h << "            break;" << eol;
+                    h << "        }" << eol;
+                }
+                h << "        default: {" << eol;
+                emitRawHex("            ");
+                h << "            break;" << eol;
+                h << "        }" << eol;
+                h << "    }" << eol;
+            }
         } else if (f.type_kind == "string") {
             if (!f.is_pointer && f.size > 0) {
                 h << "    __ctrace_buf_append(&_p, &_rem, \"" << namePrefix << "\\\"%.*s\\\"\", (int)" << f.size << ", " << accessor << ");" << eol;
@@ -1256,19 +1344,41 @@ int main(int argc, char **argv) {
             } else if (ff.type_kind == "fixed_array") {
                 h << "        sqlite3_bind_blob(_st, " << col++ << ", (const void *)(" << ff.accessor_expr << "), (int)" << ff.size << ", SQLITE_TRANSIENT);" << eol;
             } else if (ff.type_kind == "union") {
-                h << "        sqlite3_bind_blob(_st, " << col++ << ", (const void *)(&(" << ff.accessor_expr << ")), (int)" << ff.size << ", SQLITE_TRANSIENT);" << eol;
+                bool dynamic = !ff.tag_field.empty() && !ff.struct_fields.empty();
+                if (!dynamic) {
+                    h << "        sqlite3_bind_blob(_st, " << col++ << ", " << getUnionRawPointer(ff) << ", (int)(" << getUnionRawLen(ff) << "), SQLITE_TRANSIENT);" << eol;
+                } else {
+                    // Serialize the active variant into a temporary blob, exactly as the bin backend does
+                    int thisCol = col++;
+                    std::string lenVar = "_len_" + ff.flat_name;
+                    h << "        {" << eol;
+                    emitUnionSizeCalc(h, ff, lenVar, 0, false, eol);
+                    h << "        char *_u_buf = (char *)malloc((size_t)4 + (size_t)" << lenVar << ");" << eol;
+                    h << "        if (_u_buf) {" << eol;
+                    h << "            char *_p = _u_buf;" << eol;
+                    emitUnionSerialize(h, ff, lenVar, 0, false, eol);
+                    h << "            sqlite3_bind_blob(_st, " << thisCol << ", _u_buf + 4, (int)" << lenVar << ", SQLITE_TRANSIENT);" << eol;
+                    h << "            free(_u_buf);" << eol;
+                    h << "        } else {" << eol;
+                    h << "            sqlite3_bind_null(_st, " << thisCol << ");" << eol;
+                    h << "        }" << eol;
+                    h << "        }" << eol;
+                }
             } else if (ff.type_kind == "counted_array") {
                 if (!ff.struct_fields.empty() && ff.struct_fields[0].type_kind == "struct") {
+                    int thisCol = col++;
                     std::string lenVar = "_len_" + ff.flat_name;
+                    h << "        {" << eol;
                     emitCountedArraySizeCalc(h, ff, lenVar, 0, false, eol);
                     h << "        char *_ca_buf = (char *)malloc((size_t)4 + (size_t)" << lenVar << ");" << eol;
                     h << "        if (_ca_buf) {" << eol;
                     h << "            char *_p = _ca_buf;" << eol;
                     emitCountedArraySerialize(h, ff, lenVar, 0, false, eol);
-                    h << "            sqlite3_bind_blob(_st, " << col++ << ", _ca_buf + 4, (int)" << lenVar << ", SQLITE_TRANSIENT);" << eol;
+                    h << "            sqlite3_bind_blob(_st, " << thisCol << ", _ca_buf + 4, (int)" << lenVar << ", SQLITE_TRANSIENT);" << eol;
                     h << "            free(_ca_buf);" << eol;
                     h << "        } else {" << eol;
-                    h << "            sqlite3_bind_null(_st, " << col++ << ");" << eol;
+                    h << "            sqlite3_bind_null(_st, " << thisCol << ");" << eol;
+                    h << "        }" << eol;
                     h << "        }" << eol;
                 } else {
                     std::string cnt = getCountExpr(ff.accessor_expr, ff.counted_by);

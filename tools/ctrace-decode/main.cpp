@@ -26,10 +26,20 @@
 
 using json = ctrace::json;
 
+// The stream is always little-endian; swap on big-endian hosts.
 template <typename T>
 static inline T read_unaligned(const uint8_t *p) {
     T v;
     std::memcpy(&v, p, sizeof(T));
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    if constexpr (sizeof(T) == 2) {
+        uint16_t u; std::memcpy(&u, &v, 2); u = __builtin_bswap16(u); std::memcpy(&v, &u, 2);
+    } else if constexpr (sizeof(T) == 4) {
+        uint32_t u; std::memcpy(&u, &v, 4); u = __builtin_bswap32(u); std::memcpy(&v, &u, 4);
+    } else if constexpr (sizeof(T) == 8) {
+        uint64_t u; std::memcpy(&u, &v, 8); u = __builtin_bswap64(u); std::memcpy(&v, &u, 8);
+    }
+#endif
     return v;
 }
 
@@ -108,7 +118,16 @@ public:
             return;
         }
         char tmp[64];
-        int n = std::snprintf(tmp, sizeof(tmp), "%.17g", v);
+        int n = 0;
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+        {
+            auto res = std::to_chars(tmp, tmp + sizeof(tmp) - 2, v);
+            n = (res.ec == std::errc()) ? (int)(res.ptr - tmp) : 0;
+        }
+#endif
+        if (n == 0) {
+            n = std::snprintf(tmp, sizeof(tmp), "%.17g", v);
+        }
         if (n > 0) {
             bool hasDotOrExp = false;
             for (int i = 0; i < n; ++i) {
@@ -174,6 +193,7 @@ struct FieldDesc {
     bool is_signed = false;
     std::string counted_by;
     std::string tag_field;
+    std::string tag_flat_name; // tag field name with the same flattening prefix as this union
     int64_t tag_val = 0;
     bool has_tag_val = false;
     std::unordered_map<int64_t, std::string> enum_map;
@@ -181,35 +201,48 @@ struct FieldDesc {
     std::vector<FieldDesc> union_cases;
 };
 
-static void parseFieldDesc(const json &f, FieldDesc &fd) {
-    fd.name = f.value("name", "");
+static std::vector<FieldDesc> flattenSchemaFields(const json &fields);
+
+// Parses one schema field. 'name' is its flattened name and 'prefix' the flattening
+// prefix of its enclosing struct (used to locate a union's tag among its siblings).
+static void parseFieldDesc(const json &f, FieldDesc &fd, const std::string &name, const std::string &prefix) {
+    fd.name = name;
     fd.type_str = f.value("type", "uint64");
     fd.size = f.value("size", 0ULL);
     fd.is_signed = f.value("is_signed", false);
     fd.type = mapFieldType(fd.type_str, fd.is_signed);
     fd.counted_by = f.value("counted_by", "");
     fd.tag_field = f.value("tag_field", "");
+    if (!fd.tag_field.empty()) {
+        fd.tag_flat_name = prefix.empty() ? fd.tag_field : (prefix + "_" + fd.tag_field);
+    }
     if (f.contains("constants") && f["constants"].is_array()) {
         for (const auto &c : f["constants"]) {
             fd.enum_map[c.value("value", 0LL)] = c.value("name", "");
         }
     }
     if (f.contains("fields") && f["fields"].is_array()) {
-        for (const auto &sf : f["fields"]) {
-            FieldDesc sfd;
-            parseFieldDesc(sf, sfd);
-            fd.sub_fields.push_back(sfd);
+        if (fd.type == FieldType::Struct) {
+            // Nested structs are flattened the same way as top-level event fields
+            fd.sub_fields = flattenSchemaFields(f["fields"]);
+        } else {
+            // Array element descriptor(s)
+            for (const auto &sf : f["fields"]) {
+                FieldDesc sfd;
+                parseFieldDesc(sf, sfd, sf.value("name", ""), "");
+                fd.sub_fields.push_back(sfd);
+            }
         }
     }
     if (f.contains("union_cases") && f["union_cases"].is_array()) {
         for (const auto &uc : f["union_cases"]) {
             FieldDesc ucd;
-            parseFieldDesc(uc, ucd);
-            if (uc.contains("array_index")) {
-                ucd.tag_val = uc.value("array_index", 0LL);
-                ucd.has_tag_val = true;
-            } else if (uc.contains("tag_val")) {
+            parseFieldDesc(uc, ucd, uc.value("name", ""), "");
+            if (uc.contains("tag_val")) {
                 ucd.tag_val = uc.value("tag_val", 0LL);
+                ucd.has_tag_val = true;
+            } else if (uc.contains("array_index")) { // older schemas
+                ucd.tag_val = uc.value("array_index", 0LL);
                 ucd.has_tag_val = true;
             }
             fd.union_cases.push_back(ucd);
@@ -229,39 +262,8 @@ static void flattenFieldsRaw(const json &fields, const std::string &prefix, std:
             }
         } else {
             FieldDesc fd;
-            fd.name = name;
-            fd.type_str = ftype;
-            fd.size = f.value("size", 8ULL);
-            fd.is_signed = f.value("is_signed", false);
-            fd.type = mapFieldType(fd.type_str, fd.is_signed);
-            fd.counted_by = f.value("counted_by", "");
-            fd.tag_field = f.value("tag_field", "");
-            if (f.contains("constants") && f["constants"].is_array()) {
-                for (const auto &c : f["constants"]) {
-                    fd.enum_map[c.value("value", 0LL)] = c.value("name", "");
-                }
-            }
-            if (f.contains("fields") && f["fields"].is_array()) {
-                for (const auto &sf : f["fields"]) {
-                    FieldDesc sfd;
-                    parseFieldDesc(sf, sfd);
-                    fd.sub_fields.push_back(sfd);
-                }
-            }
-            if (f.contains("union_cases") && f["union_cases"].is_array()) {
-                for (const auto &uc : f["union_cases"]) {
-                    FieldDesc ucd;
-                    parseFieldDesc(uc, ucd);
-                    if (uc.contains("array_index")) {
-                        ucd.tag_val = uc.value("array_index", 0LL);
-                        ucd.has_tag_val = true;
-                    } else if (uc.contains("tag_val")) {
-                        ucd.tag_val = uc.value("tag_val", 0LL);
-                        ucd.has_tag_val = true;
-                    }
-                    fd.union_cases.push_back(ucd);
-                }
-            }
+            parseFieldDesc(f, fd, name, prefix);
+            if (!f.contains("size")) fd.size = 8;
             out.push_back(std::move(fd));
         }
     }
@@ -439,9 +441,11 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                 size_t elem_off = 0;
                 for (size_t i = 0; i < cnt; ++i) {
                     if (i > 0) out.write_str(", ");
+                    size_t item_start = elem_off;
                     if (!decodeFieldValue(arr_bytes, elem_off, sz, elem, out, nullptr, nullptr, false)) {
                         return false;
                     }
+                    if (elem_off == item_start) return false;
                 }
             } else {
                 for (size_t i = 0; i < sz; ++i) {
@@ -466,6 +470,7 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                     std::vector<std::pair<std::string, int64_t>> elem_tags;
                     while (offset < end_off) {
                         if (idx++ > 0) out.write_str(", ");
+                        size_t item_start = offset;
                         out.write_char('{');
                         elem_tags.clear();
                         for (size_t j = 0; j < elem.sub_fields.size(); ++j) {
@@ -478,6 +483,7 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                             }
                         }
                         out.write_char('}');
+                        if (offset == item_start) return false; // zero-sized element: corrupt length
                     }
                     out.write_char(']');
                     return true;
@@ -492,9 +498,11 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
                     size_t idx = 0;
                     while (offset < end_off) {
                         if (idx++ > 0) out.write_str(", ");
+                        size_t item_start = offset;
                         if (!decodeFieldValue(stream, offset, end_off, elem, out, nullptr, nullptr, false)) {
                             return false;
                         }
+                        if (offset == item_start) return false;
                     }
                     out.write_char(']');
                     return true;
@@ -518,7 +526,17 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
             std::string tag_field = !fld.tag_field.empty() ? fld.tag_field : fld.counted_by;
             int64_t tag_val = -1;
             bool found_tag = false;
-            if (current_tags && !tag_field.empty()) {
+            if (current_tags && !fld.tag_flat_name.empty()) {
+                for (auto it = current_tags->rbegin(); it != current_tags->rend(); ++it) {
+                    if (it->first == fld.tag_flat_name) {
+                        tag_val = it->second;
+                        found_tag = true;
+                        break;
+                    }
+                }
+            }
+            if (!found_tag && current_tags && !tag_field.empty()) {
+                // Fallback: the most recently decoded field named like the tag
                 for (auto it = current_tags->rbegin(); it != current_tags->rend(); ++it) {
                     if (it->first == tag_field ||
                         (it->first.size() > tag_field.size() &&

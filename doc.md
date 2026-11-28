@@ -144,6 +144,9 @@ For each argument `Expr` passed to `__ctrace_hook`:
 * **Hierarchical Struct Serialization:** `ctrace-scan` discovers struct hierarchies up to 4 levels deep, supporting passing structs by value or by pointer (`const Device *`, `&dev`, etc.) with safe `(null)` pointer dereferencing.
 * **`CTRACE_COUNTED_BY(field)`:** Pointer fields (`T *`) and Flexible Array Members (`T []`) annotated with `CTRACE_COUNTED_BY(count_field)` are captured dynamically without copying unused buffer space.
 * **Multi-Layer Nesting:** Dynamic arrays can be arbitrarily nested (e.g. a batch containing dynamic arrays of sensors, each containing dynamic arrays of float readings).
+* **Out-of-Line Bindings:** `CTRACE_BIND_COUNT(type, array, count)` and `CTRACE_BIND_UNION(type, tag, value, member)` attach count and discriminator information to structs from headers that cannot be edited. The scanner records them as `annotate` attributes on dummy variables and applies them while resolving the struct.
+* **Discriminated Unions:** A bound union is serialized as `uint32_t len` plus the active member selected by the sibling tag field (any `int64_t`-representable value, several values may map to one member). Each union in a struct is bound independently; anonymous unions and unions reached through struct pointers are handled. Unbound unions and unknown tag values fall back to the raw `sizeof(union)` bytes.
+* **Fixed Arrays:** In-struct arrays longer than 4 elements and arrays passed directly to `TRACE_EVENT` are captured as contiguous `fixed_array` blobs; shorter in-struct arrays are unrolled into `name_0 .. name_N` scalars. C11 anonymous struct members are spliced into their parent.
 * **Backends Support:**
   * `stdout`: Unrolls nested arrays into JSON-like formatting: `batch={num=2, sensors=[{id=1, readings=[1.5, 2.5]}]}`.
   * `bin` / `bin-zstd`: Serializes length prefix (`uint32_t`) followed by exact dynamic payload bytes in-place.

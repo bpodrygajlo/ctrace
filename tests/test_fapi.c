@@ -85,6 +85,69 @@ CTRACE_BIND_COUNT(fapi_dci_variant_t, cce, n_cand);
 CTRACE_BIND_UNION(fapi_dyn_pdu_t, type, 1, dci);
 CTRACE_BIND_UNION(fapi_dyn_pdu_t, type, 8, ta);
 
+/* Negative tag value selecting an error variant */
+typedef struct { int32_t code; } fapi_err_t;
+typedef struct { uint16_t len; } fapi_ok_t;
+typedef struct {
+    int status;
+    union { fapi_err_t err; fapi_ok_t ok; } r;
+} fapi_result_t;
+CTRACE_BIND_UNION(fapi_result_t, status, -1, err);
+CTRACE_BIND_UNION(fapi_result_t, status, 0, ok);
+
+/* Tag value above INT32_MAX in an unsigned tag field */
+typedef struct { uint8_t a; } fapi_big_a_t;
+typedef struct { uint32_t b; } fapi_big_b_t;
+typedef struct {
+    uint32_t kind;
+    union { fapi_big_a_t a; fapi_big_b_t b; } v;
+} fapi_big_tag_t;
+CTRACE_BIND_UNION(fapi_big_tag_t, kind, 0xFFFFFFFFu, a);
+CTRACE_BIND_UNION(fapi_big_tag_t, kind, 7, b);
+
+/* Two unions in one struct, each with its own tag field */
+typedef struct { uint16_t a1; } fapi_two_a_t;
+typedef struct { uint32_t b1; } fapi_two_b_t;
+typedef struct { uint8_t c1; } fapi_two_c_t;
+typedef struct { int16_t d1; } fapi_two_d_t;
+typedef struct {
+    uint8_t t1;
+    union { fapi_two_a_t a; fapi_two_b_t b; } u1;
+    uint8_t t2;
+    union { fapi_two_c_t c; fapi_two_d_t d; } u2;
+} fapi_two_unions_t;
+CTRACE_BIND_UNION(fapi_two_unions_t, t1, 1, a);
+CTRACE_BIND_UNION(fapi_two_unions_t, t1, 2, b);
+CTRACE_BIND_UNION(fapi_two_unions_t, t2, 5, c);
+CTRACE_BIND_UNION(fapi_two_unions_t, t2, 6, d);
+
+/* Union variant holding a nested struct */
+typedef struct { uint16_t x; uint16_t y; } fapi_hdr_t;
+typedef struct { fapi_hdr_t hdr; uint32_t body; } fapi_nested_variant_t;
+typedef struct {
+    uint8_t sel;
+    union { fapi_nested_variant_t nv; uint32_t plain; } u;
+} fapi_nested_pdu_t;
+CTRACE_BIND_UNION(fapi_nested_pdu_t, sel, 1, nv);
+CTRACE_BIND_UNION(fapi_nested_pdu_t, sel, 2, plain);
+
+/* Bare union passed by pointer */
+typedef union { uint32_t word; uint8_t bytes[4]; } fapi_word_t;
+
+/* Counted struct array whose element has two bools */
+typedef struct { bool on; bool err; uint8_t lvl; } fapi_flags_t;
+typedef struct {
+    uint8_t n;
+    fapi_flags_t flags[4];
+} fapi_flags_list_t;
+CTRACE_BIND_COUNT(fapi_flags_list_t, flags, n);
+
+/* C11 anonymous struct member */
+typedef struct {
+    int id;
+    struct { uint16_t x; uint16_t y; };
+} fapi_anon_struct_t;
+
 // Out-of-line bindings (without modifying 3rd-party vendor headers)
 CTRACE_BIND_COUNT(fapi_dl_tti_req_t, cce_list, num_cce);
 CTRACE_BIND_UNION(fapi_pdu_t, pdu_type, 0, dlsch_pdu);
@@ -186,6 +249,73 @@ int main(void) {
     dyn2.type = 8;
     dyn2.ta.ta_val = 31;
     TRACE_EVENT(fapi_dyn_pdu_event, dyn2);
+
+    // Unmatched tag: the union falls back to its raw bytes
+    fapi_pdu_t pdu4;
+    memset(&pdu4, 0, sizeof(pdu4));
+    pdu4.pdu_type = 99;
+    pdu4.u.dlsch_pdu.tti = 0x11223344;
+    TRACE_EVENT(fapi_pdu_event, pdu4);
+
+    // Negative tag value
+    fapi_result_t res;
+    memset(&res, 0, sizeof(res));
+    res.status = -1;
+    res.r.err.code = -22;
+    TRACE_EVENT(fapi_result_event, res);
+
+    // Tag value above INT32_MAX
+    fapi_big_tag_t big;
+    memset(&big, 0, sizeof(big));
+    big.kind = 0xFFFFFFFFu;
+    big.v.a.a = 200;
+    TRACE_EVENT(fapi_big_tag_event, big);
+
+    // Two unions with distinct tags in one struct
+    fapi_two_unions_t two;
+    memset(&two, 0, sizeof(two));
+    two.t1 = 2;
+    two.u1.b.b1 = 70000;
+    two.t2 = 5;
+    two.u2.c.c1 = 9;
+    TRACE_EVENT(fapi_two_unions_event, two);
+
+    // Nested struct inside a union variant
+    fapi_nested_pdu_t nested;
+    memset(&nested, 0, sizeof(nested));
+    nested.sel = 1;
+    nested.u.nv.hdr.x = 3;
+    nested.u.nv.hdr.y = 4;
+    nested.u.nv.body = 500;
+    TRACE_EVENT(fapi_nested_event, nested);
+
+    // Bare union by pointer, and a NULL union pointer
+    fapi_word_t word;
+    word.word = 0x04030201;
+    fapi_word_t *wp = &word;
+    fapi_word_t *wnull = NULL;
+    TRACE_EVENT(fapi_word_event, wp);
+    TRACE_EVENT(fapi_word_event, wnull);
+
+    // Counted struct array with two bool fields per element
+    fapi_flags_list_t fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.n = 2;
+    fl.flags[0].on = true;  fl.flags[0].err = false; fl.flags[0].lvl = 1;
+    fl.flags[1].on = false; fl.flags[1].err = true;  fl.flags[1].lvl = 2;
+    TRACE_EVENT(fapi_flags_event, fl);
+
+    // Fixed-size array passed directly
+    uint16_t samples[6] = { 1, 2, 3, 4, 5, 6 };
+    TRACE_EVENT(fapi_samples_event, samples);
+
+    // Anonymous struct member
+    fapi_anon_struct_t as;
+    memset(&as, 0, sizeof(as));
+    as.id = 12;
+    as.x = 7;
+    as.y = 9;
+    TRACE_EVENT(fapi_anon_struct_event, as);
 
     ctrace_flush();
     ctrace_shutdown();

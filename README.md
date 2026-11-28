@@ -249,6 +249,33 @@ TRACE_EVENT(wire_frame, frame);
 // frame={msg_type=77, num_items=3, items=[100, 200, 300]}
 ```
 
+### Third-Party Headers & Discriminated Unions (`CTRACE_BIND_COUNT`, `CTRACE_BIND_UNION`)
+
+Vendor headers (e.g. FAPI/nFAPI message definitions) cannot be annotated in place. Bindings declared once in any `.c` file attach the same information out of line:
+
+```c
+// Vendor header (unchanged)
+typedef struct { uint16_t num_pdus; fapi_pdu_t pdus[64]; } fapi_dl_tti_req_t;
+typedef struct {
+    uint16_t pdu_type;
+    union { fapi_dlsch_pdu_t dlsch; fapi_pdcch_pdu_t pdcch; } u;
+} fapi_pdu_t;
+
+// Your .c file
+CTRACE_BIND_COUNT(fapi_dl_tti_req_t, pdus, num_pdus);        // only num_pdus elements are serialized
+CTRACE_BIND_UNION(fapi_pdu_t, pdu_type, 0, dlsch);           // pdu_type == 0  -> u.dlsch
+CTRACE_BIND_UNION(fapi_pdu_t, pdu_type, 1, pdcch);           // pdu_type == 1  -> u.pdcch
+CTRACE_BIND_UNION(fapi_pdu_t, pdu_type, 2, dlsch);           // several tags may select one member
+
+TRACE_EVENT(dl_tti, req);
+// stdout: req={num_pdus=1, pdus=[{pdu_type=1, u={pdcch={freq_domain=43981, aggregation_level=4}}}]}
+```
+
+* The tag field is a sibling of the union; tag values may be enum constants, negative numbers or full-range unsigned values.
+* Anonymous unions, several unions per struct (each with its own tag) and unions reached through a struct pointer are supported.
+* A tag value without a binding, or a union without any binding (e.g. `pthread_mutex_t`), is captured as the raw `sizeof(union)` bytes and shown as hex.
+* On the wire (`bin`, `ctf`, `sqlite` BLOB) a union is `uint32_t len` followed by the serialized active member; decoders select the member from the tag field.
+
 ---
 
 ## API Reference
@@ -260,6 +287,8 @@ TRACE_EVENT(wire_frame, frame);
 | `TRACE_EVENT(name, ...)` | Instruments an event with arbitrary local variables, expressions, or structs. |
 | `TRACE_BYTES(ptr, len)` | Constructs a `ctrace_bytes_t` fat-pointer payload for raw buffers. |
 | `CTRACE_COUNTED_BY(field)` | Struct attribute binding a dynamic pointer (`T*`) or FAM (`T[]`) to an integer counter field. Supports arbitrary multi-layer nesting. |
+| `CTRACE_BIND_COUNT(type, array, count)` | Out-of-line equivalent of `CTRACE_COUNTED_BY` for structs whose header cannot be edited; also binds fixed arrays (`T[N]`). |
+| `CTRACE_BIND_UNION(type, tag, value, member)` | Declares that `member` of the union inside `type` is active when the sibling field `tag` equals `value`. |
 | `void ctrace_init(const char *target_uri)` | Initializes the runtime (`NULL` for default, directory for CTF, file for binary, `":memory:"` for SQLite). |
 | `void ctrace_flush(void)` | Flushes pending events in ring buffers, chunks, or transactions to disk. |
 | `void ctrace_shutdown(void)` | Flushes and terminates writer threads, closes file handles or databases. |
@@ -298,6 +327,9 @@ TRACE_EVENT(wire_frame, frame);
 | **`const char *`** | `"%s"` (null-safe) | `uint32_t len` + bytes | `TEXT` (`bind_text`) | CTF `string` (null-term) |
 | **`ctrace_bytes_t`** | Hex preview | `uint32_t len` + bytes | `BLOB` (`bind_blob`) | `uint32_t len` + dynamic array |
 | **`struct`** | Flattened `field_sub=val` | Recursive serialization (skips pointers) | Flattened columns (`field_sub`) | Flattened struct fields |
+| **`T[N]` (N > 4, or passed directly)** | Hex preview | Raw `memcpy` of the array | `BLOB` | `uint8_t name[N]` |
+| **`union` (bound)** | `u={member={...}}` | `uint32_t len` + active member | `BLOB` (active member) | `uint32_t len` + dynamic array |
+| **`union` (unbound)** | Hex preview | `uint32_t len` + raw bytes | `BLOB` (raw bytes) | `uint32_t len` + dynamic array |
 
 ---
 

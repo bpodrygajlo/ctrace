@@ -42,6 +42,7 @@ def _flatten_fields_raw(fields, prefix=""):
             sub_fields = f.get("fields", [])
             flat.extend(_flatten_fields_raw(sub_fields, prefix=name))
         else:
+            tag_field = f.get("tag_field", "")
             flat.append({
                 "name": name,
                 "type": f.get("type", "uint64"),
@@ -50,10 +51,58 @@ def _flatten_fields_raw(fields, prefix=""):
                 "constants": f.get("constants", []),
                 "fields": f.get("fields", []),
                 "counted_by": f.get("counted_by", ""),
-                "tag_field": f.get("tag_field", ""),
+                "tag_field": tag_field,
+                # The tag is a sibling of the union, so it carries the same flattening prefix
+                "tag_flat_name": (f"{prefix}_{tag_field}" if prefix else tag_field) if tag_field else "",
                 "union_cases": f.get("union_cases", []),
             })
     return flat
+
+
+def case_tag_value(case):
+    """Discriminator value of a union case; older schemas stored it as array_index."""
+    if "tag_val" in case:
+        return case["tag_val"]
+    return case.get("array_index")
+
+
+def lookup_tag(record, fld):
+    """Finds the discriminator value for a union field in the already decoded siblings."""
+    if record is None:
+        return None
+    tag_flat = fld.get("tag_flat_name", "")
+    if tag_flat and tag_flat in record:
+        return record[tag_flat]
+    tag_field = fld.get("tag_field") or fld.get("counted_by", "")
+    if not tag_field:
+        return None
+    if tag_field in record:
+        return record[tag_field]
+    # Fallback: the most recently decoded field whose name ends with the tag name
+    for k in reversed(list(record.keys())):
+        if k.endswith(f"_{tag_field}"):
+            return record[k]
+    return None
+
+
+def decode_fixed_array(arr_bytes, elem_schema):
+    """Decodes the packed elements of a fixed-size array."""
+    elem_type = elem_schema.get("type", "uint8")
+    if elem_type in TYPE_FORMATS and elem_type != "bool":
+        fmt, esz = TYPE_FORMATS[elem_type]
+        cnt = len(arr_bytes) // esz
+        code = fmt[1:] if fmt.startswith("<") else fmt
+        return list(struct.unpack_from(f"<{cnt}{code}", arr_bytes, 0))
+    esz = elem_schema.get("size", 1) or 1
+    vals = []
+    off = 0
+    while off + esz <= len(arr_bytes):
+        val, next_off = decode_field_value(arr_bytes, off, len(arr_bytes), elem_schema)
+        if next_off is None or next_off <= off:
+            break
+        vals.append(val)
+        off = next_off
+    return vals
 
 def flatten_schema_fields(fields):
     raw = _flatten_fields_raw(fields, "")
@@ -106,13 +155,7 @@ def decode_field_value(stream_data, offset, total_len, fld, current_record=None)
         offset += sz
         sub_fields = fld.get("fields", [])
         if sub_fields:
-            elem_schema = sub_fields[0]
-            elem_type = elem_schema.get("type", "uint8")
-            if elem_type in TYPE_FORMATS and TYPE_FORMATS[elem_type][1] > 1:
-                fmt, esz = TYPE_FORMATS[elem_type]
-                cnt = sz // esz
-                vals = list(struct.unpack_from(f"<{cnt}{fmt[1:] if fmt.startswith('<') else fmt}", arr_bytes, 0))
-                return vals, offset
+            return decode_fixed_array(arr_bytes, sub_fields[0]), offset
         return list(arr_bytes), offset
 
     if ftype == "struct":
@@ -139,22 +182,13 @@ def decode_field_value(stream_data, offset, total_len, fld, current_record=None)
             return None, None
         u_data = stream_data[offset:offset + u_len]
         offset += u_len
-        tag_field = fld.get("tag_field") or fld.get("counted_by", "")
-        cases = fld.get("union_cases", [])
-        if current_record is not None:
-            tag_val = current_record.get(tag_field)
-            if tag_val is None and tag_field:
-                for k, v in current_record.items():
-                    if k == tag_field or k.endswith(f"_{tag_field}"):
-                        tag_val = v
-                        break
-            if tag_val is not None:
-                for c in cases:
-                    c_tag = c.get("array_index") if "array_index" in c else c.get("tag_val")
-                    if c_tag == tag_val or str(c.get("tag_val_str")) == str(tag_val) or str(c.get("array_parent")) == str(tag_val):
-                        var_rec = dict(current_record) if current_record else {}
-                        val, _ = decode_field_value(u_data, 0, u_len, c, var_rec)
-                        return {c["name"]: val}, offset
+        tag_val = lookup_tag(current_record, fld)
+        if tag_val is not None:
+            for c in fld.get("union_cases", []):
+                if case_tag_value(c) == tag_val:
+                    var_rec = dict(current_record)
+                    val, _ = decode_field_value(u_data, 0, u_len, c, var_rec)
+                    return {c["name"]: val}, offset
         return u_data.hex(), offset
 
     if ftype == "counted_array":
@@ -183,17 +217,20 @@ def decode_field_value(stream_data, offset, total_len, fld, current_record=None)
             elem_flat = flatten_schema_fields(elem_schema.get("fields", []))
             while sub_off < end_offset:
                 item_obj = {}
+                item_start = sub_off
                 for sf in elem_flat:
                     val, next_off = decode_field_value(stream_data, sub_off, end_offset, sf, item_obj)
                     if next_off is None:
                         return None, None
                     item_obj[sf["name"]] = val
                     sub_off = next_off
+                if sub_off == item_start:
+                    return None, None  # zero-sized element: corrupt length, never loop forever
                 items.append(item_obj)
         else:
             while sub_off < end_offset:
                 val, next_off = decode_field_value(stream_data, sub_off, end_offset, elem_schema)
-                if next_off is None:
+                if next_off is None or next_off <= sub_off:
                     return None, None
                 items.append(val)
                 sub_off = next_off
@@ -258,8 +295,9 @@ class FastEventDecoder:
                 self.scalar_meta.append((fld["name"], True, None))
             elif ftype == "enum":
                 sz = fld.get("size", 4)
-                code = "i" if sz == 4 else ("h" if sz == 2 else ("b" if sz == 1 else "q"))
-                fmt_parts.append(code)
+                is_signed = fld.get("is_signed", True)
+                fmt, sz = ENUM_FORMATS.get((sz, is_signed), ("<i", 4))
+                fmt_parts.append(fmt[1:] if fmt.startswith("<") else fmt)
                 total_size += sz
                 cmap = {c["value"]: c["name"] for c in fld.get("constants", [])}
                 self.scalar_meta.append((fld["name"], False, cmap))
