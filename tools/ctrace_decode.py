@@ -387,6 +387,9 @@ def decode_stream(stream_data, schema):
                 raise ValueError(f"Truncated event '{dec.name}' in binary stream")
             decoded.append(record)
 
+    if offset != total_len:
+        raise ValueError(f"Trailing unparsed bytes at stream byte offset {offset} (stream size {total_len})")
+
     decoded.sort(key=lambda r: r["timestamp_ns"])
     return decoded, anchor
 
@@ -422,9 +425,16 @@ def sqlite_value(ftype, value):
         return int(value)
     if ftype == "bytes":
         return bytes.fromhex(value)
+    if ftype == "uint64" and value > 0x7FFFFFFFFFFFFFFF:
+        return value - (1 << 64)  # SQLite has no unsigned 64-bit; wrap like the sqlite backend does
     if isinstance(value, (list, dict)):
         return str(value)
     return value
+
+
+def sql_ident(name):
+    """Quotes an identifier so that field names such as 'order' or 'group' are usable."""
+    return '"' + name.replace('"', '""') + '"'
 
 
 def write_sqlite(db_path, schema, events, anchor, raw_ts):
@@ -436,8 +446,8 @@ def write_sqlite(db_path, schema, events, anchor, raw_ts):
     for ev in schema.get("events", []):
         flat = flatten_schema_fields(ev.get("fields", []))
         flat_by_name[ev["name"]] = flat
-        cols = ", ".join(f"{f['name']} {sqlite_column_type(f['type'])}" for f in flat)
-        db.execute(f"CREATE TABLE ctrace_{ev['name']} (ts_ns INTEGER, ts TEXT{', ' + cols if cols else ''});")
+        cols = ", ".join(f"{sql_ident(f['name'])} {sqlite_column_type(f['type'])}" for f in flat)
+        db.execute(f"CREATE TABLE {sql_ident('ctrace_' + ev['name'])} (ts_ns INTEGER, ts TEXT{', ' + cols if cols else ''});")
     rows_by_name = {}
     for ev in events:
         flat = flat_by_name[ev["event"]]
@@ -446,7 +456,7 @@ def write_sqlite(db_path, schema, events, anchor, raw_ts):
         rows_by_name.setdefault(ev["event"], []).append(row)
     for name, rows in rows_by_name.items():
         placeholders = ", ".join("?" * len(rows[0]))
-        db.executemany(f"INSERT INTO ctrace_{name} VALUES ({placeholders});", rows)
+        db.executemany(f"INSERT INTO {sql_ident('ctrace_' + name)} VALUES ({placeholders});", rows)
     db.commit()
     db.close()
 
@@ -467,7 +477,7 @@ def decompress_zstd_chunks(data):
         comp_len, = struct.unpack_from("<I", data, offset)
         offset += 4
         if comp_len == 0 or offset + comp_len > total:
-            break
+            raise ValueError(f"Corrupt zstd frame length {comp_len} at byte offset {offset - 4}")
         chunk = data[offset:offset + comp_len]
         offset += comp_len
 

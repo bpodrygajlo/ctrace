@@ -349,6 +349,16 @@ struct EventDesc {
 // arrays or unions as their decoded text.
 class SqliteSink {
 public:
+    // Quotes an identifier so that field names such as "order" or "group" are usable
+    static std::string ident(const std::string &name) {
+        std::string q = "\"";
+        for (char c : name) {
+            if (c == '"') q += '"';
+            q += c;
+        }
+        return q + "\"";
+    }
+
     bool open(const std::string &path, const std::unordered_map<uint16_t, EventDesc> &decoders) {
 #if defined(CTRACE_HAVE_SQLITE)
         unlink(path.c_str());
@@ -359,10 +369,10 @@ public:
         sqlite3_exec(db_, "PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY; BEGIN;", nullptr, nullptr, nullptr);
         for (const auto &kv : decoders) {
             const EventDesc &ev = kv.second;
-            std::string ddl = "CREATE TABLE ctrace_" + ev.name + " (ts_ns INTEGER, ts TEXT";
-            std::string sql = "INSERT INTO ctrace_" + ev.name + " VALUES (?, ?";
+            std::string ddl = "CREATE TABLE " + ident("ctrace_" + ev.name) + " (ts_ns INTEGER, ts TEXT";
+            std::string sql = "INSERT INTO " + ident("ctrace_" + ev.name) + " VALUES (?, ?";
             for (const auto &f : ev.flat_fields) {
-                ddl += ", " + f.name + " " + columnType(f.type);
+                ddl += ", " + ident(f.name) + " " + columnType(f.type);
                 sql += ", ?";
             }
             ddl += ");";
@@ -417,7 +427,7 @@ public:
             expr = "printf('%d.%09d', ts_ns / 1000000000, ts_ns % 1000000000)";
         }
         for (const auto &kv : decoders) {
-            std::string sql = "UPDATE ctrace_" + kv.second.name + " SET ts = " + expr + ";";
+            std::string sql = "UPDATE " + ident("ctrace_" + kv.second.name) + " SET ts = " + expr + ";";
             sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, nullptr);
         }
 #else
@@ -469,6 +479,10 @@ private:
                 sqlite3_bind_double(st, col, std::strtod(tmp.c_str(), nullptr));
                 break;
             case FieldType::Bytes: {
+                if (len == 0) {
+                    sqlite3_bind_zeroblob(st, col, 0); // an empty payload is an empty BLOB, not NULL
+                    break;
+                }
                 std::vector<uint8_t> raw(len / 2);
                 for (size_t i = 0; i + 1 < len; i += 2) {
                     raw[i / 2] = (uint8_t)std::strtoul(tmp.substr(i, 2).c_str(), nullptr, 16);

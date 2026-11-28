@@ -178,7 +178,7 @@ Both decoders print one line per event, ordered by time, with wall-clock timesta
 | Decoder option | Effect |
 | :--- | :--- |
 | `-o FILE` | Write the text output to `FILE` instead of stdout. |
-| `--sqlite DB` | Also write the events to a SQLite database: one `ctrace_<event>` table per event with `ts_ns`, a readable `ts`, and one column per flattened field (scalars as numbers, bytes as `BLOB`, arrays and unions as their decoded text). |
+| `--sqlite DB` | Also write the events to a SQLite database: one `ctrace_<event>` table per event with `ts_ns`, a readable `ts`, and one column per flattened field (scalars as numbers, bytes as `BLOB`, arrays and unions as their decoded text; `uint64` above `INT64_MAX` wraps, as SQLite has no unsigned 64-bit). |
 | `--ns` | Print raw nanosecond timestamps instead of dates. |
 | `-q` | No text output (useful together with `--sqlite`). |
 

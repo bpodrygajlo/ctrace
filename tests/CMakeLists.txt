@@ -30,6 +30,7 @@ add_test(NAME test_decode_edge_cases
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_decode_edge_cases.py
             $<TARGET_FILE:ctrace-decode>
             ${CMAKE_CURRENT_BINARY_DIR}/ctrace_gen_test_bin/trace_schema.json
+            ${PROJECT_SOURCE_DIR}/tools/ctrace_decode.py
 )
 set_tests_properties(test_decode_edge_cases PROPERTIES DEPENDS test_bin)
 
