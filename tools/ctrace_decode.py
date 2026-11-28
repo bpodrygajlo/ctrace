@@ -8,6 +8,12 @@ import os
 import json
 import struct
 import subprocess
+import argparse
+import sqlite3
+from datetime import datetime
+
+CLOCK_ANCHOR_ID = 0
+CLOCK_ANCHOR_SIZE = 18
 
 TYPE_FORMATS = {
     "int8": ("b", 1),
@@ -312,6 +318,9 @@ class FastEventDecoder:
             self.struct_obj = None
 
 def decode_stream(stream_data, schema):
+    """Returns (events sorted by timestamp, clock anchor or None).
+
+    The clock anchor is the (trace_ns, wall_ns) pair from the first id-0 record."""
     decoders = {}
     for ev in schema.get("events", []):
         decoders[ev["id"]] = FastEventDecoder(ev)
@@ -319,9 +328,18 @@ def decode_stream(stream_data, schema):
     offset = 0
     total_len = len(stream_data)
     decoded = []
+    anchor = None
 
     while offset + 10 <= total_len:
         ev_id, = struct.unpack_from("<H", stream_data, offset)
+        if ev_id == CLOCK_ANCHOR_ID:
+            if offset + CLOCK_ANCHOR_SIZE > total_len:
+                raise ValueError(f"Truncated clock anchor at stream byte offset {offset}")
+            trace_ns, wall_ns = struct.unpack_from("<QQ", stream_data, offset + 2)
+            if anchor is None:
+                anchor = (trace_ns, wall_ns)
+            offset += CLOCK_ANCHOR_SIZE
+            continue
         if ev_id not in decoders:
             raise ValueError(f"Unknown event_id {ev_id} at stream byte offset {offset}")
 
@@ -370,7 +388,67 @@ def decode_stream(stream_data, schema):
             decoded.append(record)
 
     decoded.sort(key=lambda r: r["timestamp_ns"])
-    return decoded
+    return decoded, anchor
+
+
+def format_timestamp(ts_ns, anchor, raw):
+    """Wall-clock date when an anchor exists, else seconds since the trace clock origin."""
+    if raw:
+        return str(ts_ns)
+    if anchor is not None:
+        wall_ns = anchor[1] + (ts_ns - anchor[0])
+        secs, nanos = divmod(wall_ns, 1_000_000_000)
+        return f"{datetime.fromtimestamp(secs):%Y-%m-%d %H:%M:%S}.{nanos:09d}"
+    secs, nanos = divmod(ts_ns, 1_000_000_000)
+    return f"{secs}.{nanos:09d}"
+
+
+def sqlite_column_type(ftype):
+    if ftype in ("float", "double"):
+        return "REAL"
+    if ftype in ("string", "enum"):
+        return "TEXT"
+    if ftype == "bytes":
+        return "BLOB"
+    if ftype in TYPE_FORMATS:
+        return "INTEGER"
+    return "TEXT"  # arrays and unions keep their decoded text form
+
+
+def sqlite_value(ftype, value):
+    if value is None:
+        return None
+    if ftype == "bool":
+        return int(value)
+    if ftype == "bytes":
+        return bytes.fromhex(value)
+    if isinstance(value, (list, dict)):
+        return str(value)
+    return value
+
+
+def write_sqlite(db_path, schema, events, anchor, raw_ts):
+    """One table per event type, ctrace_<event>(ts_ns, ts, <flattened fields...>)."""
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    db = sqlite3.connect(db_path)
+    flat_by_name = {}
+    for ev in schema.get("events", []):
+        flat = flatten_schema_fields(ev.get("fields", []))
+        flat_by_name[ev["name"]] = flat
+        cols = ", ".join(f"{f['name']} {sqlite_column_type(f['type'])}" for f in flat)
+        db.execute(f"CREATE TABLE ctrace_{ev['name']} (ts_ns INTEGER, ts TEXT{', ' + cols if cols else ''});")
+    rows_by_name = {}
+    for ev in events:
+        flat = flat_by_name[ev["event"]]
+        row = [ev["timestamp_ns"], format_timestamp(ev["timestamp_ns"], anchor, raw_ts)]
+        row.extend(sqlite_value(f["type"], ev["fields"].get(f["name"])) for f in flat)
+        rows_by_name.setdefault(ev["event"], []).append(row)
+    for name, rows in rows_by_name.items():
+        placeholders = ", ".join("?" * len(rows[0]))
+        db.executemany(f"INSERT INTO ctrace_{name} VALUES ({placeholders});", rows)
+    db.commit()
+    db.close()
 
 def decompress_zstd_chunks(data):
     decompressed = bytearray()
@@ -411,40 +489,52 @@ def decompress_zstd_chunks(data):
     return bytes(decompressed)
 
 def main():
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <trace_schema.json> <trace.bin|trace.bin.zst>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Decode a ctrace binary stream.")
+    parser.add_argument("schema", help="trace_schema.json written by ctrace-gen")
+    parser.add_argument("trace", help="trace.bin or trace.bin.zst")
+    parser.add_argument("-o", "--output", metavar="FILE", help="write the text output to FILE instead of stdout")
+    parser.add_argument("--sqlite", metavar="DB", help="also write the decoded events to a SQLite database")
+    parser.add_argument("--ns", action="store_true", help="print raw nanosecond timestamps instead of dates")
+    parser.add_argument("-q", "--quiet", action="store_true", help="no text output")
+    args = parser.parse_args()
 
-    schema_path = sys.argv[1]
-    data_path = sys.argv[2]
-
-    with open(schema_path, "r") as f:
+    with open(args.schema, "r") as f:
         schema = json.load(f)
 
-    with open(data_path, "rb") as f:
+    with open(args.trace, "rb") as f:
         raw_data = f.read()
 
-    if data_path.endswith(".zst") or schema.get("backend") == "bin-zstd":
+    if args.trace.endswith(".zst") or schema.get("backend") == "bin-zstd":
         stream_data = decompress_zstd_chunks(raw_data)
     else:
         stream_data = raw_data
 
-    events = decode_stream(stream_data, schema)
-    
+    events, anchor = decode_stream(stream_data, schema)
+
+    if args.sqlite:
+        write_sqlite(args.sqlite, schema, events, anchor, args.ns)
+
+    if args.quiet:
+        return
+
+    out = open(args.output, "w") if args.output else sys.stdout
     # Fast buffered output (chunking into 64 KB writes)
     chunk = []
     chunk_len = 0
     for ev in events:
         field_strs = [f"{k}={v}" for k, v in ev["fields"].items()]
-        line = f"[{ev['timestamp_ns']}] {ev['event']} {' '.join(field_strs)}\n"
+        ts = format_timestamp(ev["timestamp_ns"], anchor, args.ns)
+        line = f"[{ts}] {ev['event']} {' '.join(field_strs)}\n"
         chunk.append(line)
         chunk_len += len(line)
         if chunk_len >= 65536:
-            sys.stdout.write("".join(chunk))
+            out.write("".join(chunk))
             chunk.clear()
             chunk_len = 0
     if chunk:
-        sys.stdout.write("".join(chunk))
+        out.write("".join(chunk))
+    if out is not sys.stdout:
+        out.close()
 
 if __name__ == "__main__":
     main()

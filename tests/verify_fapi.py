@@ -2,7 +2,10 @@
 import sys
 import json
 import os
+import re
+import sqlite3
 import subprocess
+import tempfile
 
 def main():
     schema_path = sys.argv[1]
@@ -99,6 +102,23 @@ def main():
     out = res.stdout
     print("Decoded output:\n" + out)
 
+    # -o writes the same text to a file; --sqlite writes a queryable database
+    with tempfile.TemporaryDirectory() as tmpdir:
+        txt_path = os.path.join(tmpdir, "out.txt")
+        db_path = os.path.join(tmpdir, "out.db")
+        subprocess.run(cmd + ["-o", txt_path, "--sqlite", db_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        with open(txt_path) as f:
+            assert f.read() == out, "-o output differs from stdout output"
+        db = sqlite3.connect(db_path)
+        assert db.execute("SELECT COUNT(*) FROM ctrace_fapi_pdu_event;").fetchone()[0] == 4
+        u_text, ts_text = db.execute("SELECT pdu1_u, ts FROM ctrace_fapi_pdu_event WHERE pdu1_pdu_type = 1;").fetchone()
+        assert "'freq_domain': 43981" in u_text, u_text
+        assert re.match(r"^20\d\d-\d\d-\d\d \d\d:\d\d:\d\d\.\d{9}$", ts_text), ts_text
+        assert db.execute("SELECT samples FROM ctrace_fapi_samples_event;").fetchone()[0] == "[1, 2, 3, 4, 5, 6]"
+        assert db.execute("SELECT rx_data_payload_len, rx_data_payload FROM ctrace_fapi_rx_event;").fetchone() == (4, "deadbeef")
+        assert db.execute("SELECT sk_n, sk_z FROM ctrace_fapi_skip_event;").fetchone() == (1, 2)
+        db.close()
+
     # Check decoded content
     assert "fapi_tti" in out
     assert "'cce_index': 10" in out
@@ -192,8 +212,9 @@ def main():
     skip_line = event_lines("fapi_skip_event")[0]
     assert skip_line.rstrip().endswith("fapi_skip_event sk_n=1 sk_z=2"), skip_line
 
-    # Output is ordered by timestamp
-    stamps = [int(l.split("]")[0][1:]) for l in lines if l.startswith("[")]
+    # Timestamps are wall-clock dates (the bin runtime writes a clock anchor) and ordered
+    stamps = [l.split("]")[0][1:] for l in lines if l.startswith("[")]
+    assert all(re.match(r"^20\d\d-\d\d-\d\d \d\d:\d\d:\d\d\.\d{9}$", s) for s in stamps), stamps[:3]
     assert stamps == sorted(stamps), "decoder output is not sorted by timestamp"
 
     print("All FAPI union, fixed-array, and dynamic count binding assertions PASSED!")

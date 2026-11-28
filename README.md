@@ -166,7 +166,23 @@ cmake -B build -S . -DCTRACE_BACKEND=bin
 cmake --build build
 ./build/my_service
 python3 /path/to/ctrace/tools/ctrace_decode.py build/ctrace_gen_my_service/trace_schema.json trace.bin
+# or the faster C++ decoder with the same options and output:
+./build/ctrace-decode build/ctrace_gen_my_service/trace_schema.json trace.bin
 ```
+
+Both decoders print one line per event, ordered by time, with wall-clock timestamps:
+```text
+[2026-11-28 14:03:22.123456789] net_rx socket_fd=42 len=512 payload=7061796c6f61645f636f6e74656e74
+```
+
+| Decoder option | Effect |
+| :--- | :--- |
+| `-o FILE` | Write the text output to `FILE` instead of stdout. |
+| `--sqlite DB` | Also write the events to a SQLite database: one `ctrace_<event>` table per event with `ts_ns`, a readable `ts`, and one column per flattened field (scalars as numbers, bytes as `BLOB`, arrays and unions as their decoded text). |
+| `--ns` | Print raw nanosecond timestamps instead of dates. |
+| `-q` | No text output (useful together with `--sqlite`). |
+
+The `bin` and `bin-zstd` runtimes write one clock-anchor record (event id 0) at `ctrace_init()` that pairs the trace clock with `CLOCK_REALTIME`; without it, decoders print seconds since the trace clock origin.
 
 Switch to **CTF (Common Trace Format)**:
 ```bash

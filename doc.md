@@ -149,6 +149,8 @@ For each argument `Expr` passed to `__ctrace_hook`:
 * **Fixed Arrays:** In-struct scalar arrays longer than 4 elements and arrays passed directly to `TRACE_EVENT` are captured as contiguous `fixed_array` blobs; shorter in-struct arrays are unrolled into `name_0 .. name_N` scalars. Arrays of structs longer than 4 elements are `counted_array` fields with a constant `array_len`, serialized element by element so that struct padding never reaches the wire. C11 anonymous struct members are spliced into their parent.
 * **Skipped Fields:** `CTRACE_SKIP` on a field, or `CTRACE_BIND_SKIP(type, field)` out of line, removes the field from the schema and from every backend.
 * **Decoder Output Order:** per-thread ring buffers are drained independently, so both decoders sort the decoded events by timestamp before printing.
+* **Clock Anchor:** the `bin` and `bin-zstd` runtimes write one record with event id 0 at init (`uint16_t 0, uint64_t trace_ns, uint64_t wall_ns`). Decoders use it to print local wall-clock dates with nanosecond precision (`--ns` keeps raw nanoseconds); without it they print seconds since the trace clock origin.
+* **Decoder Outputs:** `-o FILE` redirects the text output; `--sqlite DB` writes one `ctrace_<event>` table per event type with `ts_ns`, a readable `ts` and one column per flattened field; `-q` disables the text output.
 * **Backends Support:**
   * `stdout`: Unrolls nested arrays into JSON-like formatting: `batch={num=2, sensors=[{id=1, readings=[1.5, 2.5]}]}`.
   * `bin` / `bin-zstd`: Serializes length prefix (`uint32_t`) followed by exact dynamic payload bytes in-place.

@@ -12,6 +12,8 @@
 #include <charconv>
 #include <cstdio>
 #include <cerrno>
+#include <cstdlib>
+#include <ctime>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -23,8 +25,42 @@
 #include <zstd.h>
 #include <zstd_errors.h>
 #endif
+#if defined(CTRACE_HAVE_SQLITE)
+#include <sqlite3.h>
+#endif
 
 using json = ctrace::json;
+
+// Event id 0 is the clock anchor written by the runtime at init:
+// uint16_t id, uint64_t trace_ns, uint64_t wall_ns (CLOCK_REALTIME).
+static const uint16_t CLOCK_ANCHOR_ID = 0;
+static const size_t CLOCK_ANCHOR_SIZE = 18;
+
+struct ClockAnchor {
+    bool valid = false;
+    uint64_t trace_ns = 0;
+    uint64_t wall_ns = 0;
+};
+
+// "[2026-11-28 14:03:22.123456789]" with an anchor, "[12.345678901]" seconds without one,
+// raw nanoseconds with --ns. Returns the number of characters written.
+static int formatTimestamp(char *buf, size_t cap, uint64_t ts_ns, const ClockAnchor &anchor, bool raw_ns) {
+    if (raw_ns) {
+        return std::snprintf(buf, cap, "%llu", (unsigned long long)ts_ns);
+    }
+    if (anchor.valid) {
+        int64_t wall = (int64_t)anchor.wall_ns + ((int64_t)ts_ns - (int64_t)anchor.trace_ns);
+        if (wall < 0) wall = 0;
+        time_t secs = (time_t)(wall / 1000000000LL);
+        unsigned nanos = (unsigned)(wall % 1000000000LL);
+        struct tm tmv;
+        localtime_r(&secs, &tmv);
+        size_t n = std::strftime(buf, cap, "%Y-%m-%d %H:%M:%S", &tmv);
+        return (int)n + std::snprintf(buf + n, cap - n, ".%09u", nanos);
+    }
+    return std::snprintf(buf, cap, "%llu.%09u", (unsigned long long)(ts_ns / 1000000000ULL),
+                         (unsigned)(ts_ns % 1000000000ULL));
+}
 
 // The stream is always little-endian; swap on big-endian hosts.
 template <typename T>
@@ -306,6 +342,148 @@ struct EventDesc {
     uint16_t id = 0;
     std::string name;
     std::vector<FieldDesc> flat_fields;
+};
+
+// Optional SQLite output: one table per event type, ctrace_<event>(ts_ns, ts, <flat fields...>).
+// Scalars are stored as numbers, strings and enum names as TEXT, bytes as BLOB, and
+// arrays or unions as their decoded text.
+class SqliteSink {
+public:
+    bool open(const std::string &path, const std::unordered_map<uint16_t, EventDesc> &decoders) {
+#if defined(CTRACE_HAVE_SQLITE)
+        unlink(path.c_str());
+        if (sqlite3_open(path.c_str(), &db_) != SQLITE_OK) {
+            std::cerr << "ctrace-decode error: cannot open " << path << ": " << (db_ ? sqlite3_errmsg(db_) : "?") << "\n";
+            return false;
+        }
+        sqlite3_exec(db_, "PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY; BEGIN;", nullptr, nullptr, nullptr);
+        for (const auto &kv : decoders) {
+            const EventDesc &ev = kv.second;
+            std::string ddl = "CREATE TABLE ctrace_" + ev.name + " (ts_ns INTEGER, ts TEXT";
+            std::string sql = "INSERT INTO ctrace_" + ev.name + " VALUES (?, ?";
+            for (const auto &f : ev.flat_fields) {
+                ddl += ", " + f.name + " " + columnType(f.type);
+                sql += ", ?";
+            }
+            ddl += ");";
+            sql += ");";
+            if (sqlite3_exec(db_, ddl.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {
+                std::cerr << "ctrace-decode error: " << sqlite3_errmsg(db_) << "\n";
+                return false;
+            }
+            sqlite3_stmt *st = nullptr;
+            if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+                std::cerr << "ctrace-decode error: " << sqlite3_errmsg(db_) << "\n";
+                return false;
+            }
+            stmts_[ev.id] = st;
+        }
+        return true;
+#else
+        (void)path; (void)decoders;
+        std::cerr << "ctrace-decode error: compiled without SQLite support, --sqlite is unavailable\n";
+        return false;
+#endif
+    }
+
+    // 'values' holds each flat field's decoded text (top-level form, no quotes)
+    void insert(const EventDesc &ev, uint64_t ts_ns, const std::vector<std::pair<const char *, size_t>> &values) {
+#if defined(CTRACE_HAVE_SQLITE)
+        sqlite3_stmt *st = stmts_[ev.id];
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)ts_ns);
+        sqlite3_bind_null(st, 2);
+        for (size_t i = 0; i < ev.flat_fields.size(); ++i) {
+            bindValue(st, (int)i + 3, ev.flat_fields[i].type, values[i].first, values[i].second);
+        }
+        sqlite3_step(st);
+        sqlite3_reset(st);
+#else
+        (void)ev; (void)ts_ns; (void)values;
+#endif
+    }
+
+    // Fills the readable 'ts' column once the whole stream (and so the clock anchor) is known
+    void finish(const std::unordered_map<uint16_t, EventDesc> &decoders, const ClockAnchor &anchor, bool raw_ns) {
+#if defined(CTRACE_HAVE_SQLITE)
+        if (!db_) return;
+        std::string expr;
+        if (raw_ns) {
+            expr = "CAST(ts_ns AS TEXT)";
+        } else if (anchor.valid) {
+            long long off = (long long)anchor.wall_ns - (long long)anchor.trace_ns;
+            std::string w = "(ts_ns + (" + std::to_string(off) + "))";
+            expr = "strftime('%Y-%m-%d %H:%M:%S', " + w + " / 1000000000, 'unixepoch', 'localtime') || printf('.%09d', " + w + " % 1000000000)";
+        } else {
+            expr = "printf('%d.%09d', ts_ns / 1000000000, ts_ns % 1000000000)";
+        }
+        for (const auto &kv : decoders) {
+            std::string sql = "UPDATE ctrace_" + kv.second.name + " SET ts = " + expr + ";";
+            sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, nullptr);
+        }
+#else
+        (void)decoders; (void)anchor; (void)raw_ns;
+#endif
+    }
+
+    void close() {
+#if defined(CTRACE_HAVE_SQLITE)
+        if (!db_) return;
+        for (auto &kv : stmts_) sqlite3_finalize(kv.second);
+        stmts_.clear();
+        sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
+        sqlite3_close(db_);
+        db_ = nullptr;
+#endif
+    }
+
+    ~SqliteSink() { close(); }
+
+private:
+    static const char *columnType(FieldType t) {
+        switch (t) {
+            case FieldType::Float: case FieldType::Double: return "REAL";
+            case FieldType::String: case FieldType::Enum: return "TEXT";
+            case FieldType::Bytes: return "BLOB";
+            case FieldType::U8: case FieldType::I8: case FieldType::U16: case FieldType::I16:
+            case FieldType::U32: case FieldType::I32: case FieldType::U64: case FieldType::I64:
+            case FieldType::Bool: return "INTEGER";
+            default: return "TEXT";
+        }
+    }
+
+#if defined(CTRACE_HAVE_SQLITE)
+    static void bindValue(sqlite3_stmt *st, int col, FieldType t, const char *text, size_t len) {
+        std::string tmp(text, len);
+        switch (t) {
+            case FieldType::U8: case FieldType::I8: case FieldType::U16: case FieldType::I16:
+            case FieldType::U32: case FieldType::I32: case FieldType::I64:
+                sqlite3_bind_int64(st, col, (sqlite3_int64)std::strtoll(tmp.c_str(), nullptr, 10));
+                break;
+            case FieldType::U64:
+                sqlite3_bind_int64(st, col, (sqlite3_int64)std::strtoull(tmp.c_str(), nullptr, 10));
+                break;
+            case FieldType::Bool:
+                sqlite3_bind_int(st, col, tmp == "True" ? 1 : 0);
+                break;
+            case FieldType::Float: case FieldType::Double:
+                sqlite3_bind_double(st, col, std::strtod(tmp.c_str(), nullptr));
+                break;
+            case FieldType::Bytes: {
+                std::vector<uint8_t> raw(len / 2);
+                for (size_t i = 0; i + 1 < len; i += 2) {
+                    raw[i / 2] = (uint8_t)std::strtoul(tmp.substr(i, 2).c_str(), nullptr, 16);
+                }
+                sqlite3_bind_blob(st, col, raw.data(), (int)raw.size(), SQLITE_TRANSIENT);
+                break;
+            }
+            default:
+                sqlite3_bind_text(st, col, text, (int)len, SQLITE_TRANSIENT);
+                break;
+        }
+    }
+    sqlite3 *db_ = nullptr;
+    std::unordered_map<uint16_t, sqlite3_stmt *> stmts_;
+#endif
 };
 
 static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total_len,
@@ -663,21 +841,51 @@ static std::vector<uint8_t> decompressZstdFrames(const uint8_t *data, size_t tot
     return result;
 }
 
+static void usage() {
+    std::cerr << "Usage: ctrace-decode <trace_schema.json> <trace.bin|trace.bin.zst> [options]\n"
+                 "  -o FILE       write the text output to FILE instead of stdout\n"
+                 "  --sqlite DB   also write the decoded events to a SQLite database\n"
+                 "  --ns          print raw nanosecond timestamps instead of dates\n"
+                 "  -q            no text output\n";
+}
+
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        std::cerr << "Usage: ctrace-decode <trace_schema.json> <trace.bin|trace.bin.zst> [-o output.txt]\n";
-        return 1;
-    }
+    std::string schema_path;
+    std::string data_path;
+    std::string out_path;
+    std::string sqlite_path;
+    bool raw_ns = false;
+    bool quiet = false;
 
-    std::string schema_path = argv[1];
-    std::string data_path = argv[2];
-    std::string out_path = "";
-
-    for (int i = 3; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-o" && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (arg == "--sqlite" && i + 1 < argc) {
+            sqlite_path = argv[++i];
+        } else if (arg == "--ns") {
+            raw_ns = true;
+        } else if (arg == "-q" || arg == "--quiet") {
+            quiet = true;
+        } else if (arg == "-h" || arg == "--help") {
+            usage();
+            return 0;
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "ctrace-decode error: unknown option " << arg << "\n";
+            usage();
+            return 1;
+        } else if (schema_path.empty()) {
+            schema_path = arg;
+        } else if (data_path.empty()) {
+            data_path = arg;
+        } else {
+            usage();
+            return 1;
         }
+    }
+    if (schema_path.empty() || data_path.empty()) {
+        usage();
+        return 1;
     }
 
     std::ifstream ifs(schema_path);
@@ -793,8 +1001,19 @@ int main(int argc, char **argv) {
         }
     }
 
+    SqliteSink sqlite_sink;
+    if (!sqlite_path.empty() && !sqlite_sink.open(sqlite_path, decoders)) {
+        if (is_mmap) munmap((void*)stream_ptr, file_len);
+        return 1;
+    }
+
+    // The clock anchor is normally the first record but may sit anywhere (buffers drain per
+    // thread); timestamps are therefore formatted only after the whole stream was decoded.
+    ClockAnchor anchor;
+
     // Ring buffers are drained per thread, so the file is not globally time ordered.
-    // Every event line is decoded into memory first and written out sorted by timestamp.
+    // Every event line (without its timestamp) is decoded into memory first and written
+    // out sorted by timestamp.
     std::string lines;
     struct LineRef {
         uint64_t ts;
@@ -803,6 +1022,9 @@ int main(int argc, char **argv) {
     };
     std::vector<LineRef> refs;
     FastOutput fast_out(-1, &lines);
+    std::vector<std::pair<size_t, size_t>> value_ranges; // per field: [start, end) in 'lines'
+    std::vector<std::pair<const char *, size_t>> values;
+    char ts_buf[64];
 
     size_t offset = 0;
     std::vector<std::pair<std::string, int64_t>> current_tags;
@@ -811,6 +1033,21 @@ int main(int argc, char **argv) {
     while (offset + 10 <= file_len) {
         uint16_t ev_id = read_unaligned<uint16_t>(stream_ptr + offset);
         uint64_t ts_ns = read_unaligned<uint64_t>(stream_ptr + offset + 2);
+
+        if (ev_id == CLOCK_ANCHOR_ID) {
+            if (file_len - offset < CLOCK_ANCHOR_SIZE) {
+                std::cerr << "ctrace-decode error: Truncated clock anchor at offset " << offset << "\n";
+                decode_ok = false;
+                break;
+            }
+            if (!anchor.valid) {
+                anchor.valid = true;
+                anchor.trace_ns = ts_ns;
+                anchor.wall_ns = read_unaligned<uint64_t>(stream_ptr + offset + 10);
+            }
+            offset += CLOCK_ANCHOR_SIZE;
+            continue;
+        }
 
         auto it = decoders.find(ev_id);
         if (it == decoders.end()) {
@@ -823,22 +1060,22 @@ int main(int argc, char **argv) {
         offset += 10;
 
         size_t line_start = fast_out.sink_size();
-        fast_out.write_char('[');
-        fast_out.write_u64(ts_ns);
-        fast_out.write_str("] ");
         fast_out.write_str(dec.name);
 
         current_tags.clear();
+        value_ranges.clear();
         bool truncated = false;
 
         for (const auto &fld : dec.flat_fields) {
             fast_out.write_char(' ');
             fast_out.write_str(fld.name);
             fast_out.write_char('=');
+            size_t value_start = fast_out.sink_size();
             if (!decodeFieldValue(stream_ptr, offset, file_len, fld, fast_out, &current_tags, &current_tags, false)) {
                 truncated = true;
                 break;
             }
+            value_ranges.push_back({value_start, fast_out.sink_size()});
         }
         fast_out.write_char('\n');
         refs.push_back({ts_ns, line_start, fast_out.sink_size() - line_start});
@@ -848,6 +1085,15 @@ int main(int argc, char **argv) {
             decode_ok = false;
             break;
         }
+
+        if (!sqlite_path.empty()) {
+            fast_out.flush(); // the values must be in 'lines' to be read back
+            values.clear();
+            for (const auto &r : value_ranges) {
+                values.push_back({lines.data() + r.first, r.second - r.first});
+            }
+            sqlite_sink.insert(dec, ts_ns, values);
+        }
     }
 
     if (decode_ok && offset != file_len) {
@@ -856,12 +1102,20 @@ int main(int argc, char **argv) {
     }
 
     fast_out.flush();
-    std::stable_sort(refs.begin(), refs.end(), [](const LineRef &a, const LineRef &b) { return a.ts < b.ts; });
-    FastOutput file_out(out_fd);
-    for (const auto &r : refs) {
-        file_out.write_str(lines.data() + r.off, r.len);
+    sqlite_sink.finish(decoders, anchor, raw_ns);
+    sqlite_sink.close();
+    if (!quiet) {
+        std::stable_sort(refs.begin(), refs.end(), [](const LineRef &a, const LineRef &b) { return a.ts < b.ts; });
+        FastOutput file_out(out_fd);
+        for (const auto &r : refs) {
+            int n = formatTimestamp(ts_buf, sizeof(ts_buf), r.ts, anchor, raw_ns);
+            file_out.write_char('[');
+            file_out.write_str(ts_buf, (size_t)n);
+            file_out.write_str("] ");
+            file_out.write_str(lines.data() + r.off, r.len);
+        }
+        file_out.flush();
     }
-    file_out.flush();
 
     if (out_fd != STDOUT_FILENO) {
         close(out_fd);

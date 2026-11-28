@@ -108,6 +108,10 @@ if(CTRACE_HAVE_ZSTD)
     target_compile_definitions(ctrace-decode PRIVATE CTRACE_HAVE_ZSTD)
     target_link_libraries(ctrace-decode PRIVATE ${ZSTD_LIB})
 endif()
+if(CTRACE_HAVE_SQLITE)
+    target_compile_definitions(ctrace-decode PRIVATE CTRACE_HAVE_SQLITE)
+    target_link_libraries(ctrace-decode PRIVATE SQLite::SQLite3)
+endif()
 add_executable(ctrace::ctrace-decode ALIAS ctrace-decode)
 
 # Runtime libraries

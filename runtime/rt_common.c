@@ -92,6 +92,17 @@ uint64_t ctrace_now_ns(void) {
 #endif
 }
 
+void ctrace_fill_clock_anchor(uint8_t *buf) {
+    struct timespec rt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    uint64_t trace_ns = ctrace_now_ns();
+    uint64_t wall_ns = (uint64_t)rt.tv_sec * 1000000000ULL + (uint64_t)rt.tv_nsec;
+    uint16_t id = 0;
+    memcpy(buf, &id, 2);
+    memcpy(buf + 2, &trace_ns, 8);
+    memcpy(buf + 10, &wall_ns, 8);
+}
+
 FILE *ctrace_get_stdout_file(void) {
     FILE *f = g_ctrace_out;
     return f ? f : stdout;

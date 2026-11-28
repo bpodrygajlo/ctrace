@@ -325,6 +325,11 @@ void ctrace_init(const char *target_uri)
     atomic_store_explicit(&g_out_fd, fd, memory_order_release);
     g_owns_fd = owns;
 
+    // First record of the stream: the wall-clock anchor for decoders
+    uint8_t anchor[CTRACE_CLOCK_ANCHOR_SIZE];
+    ctrace_fill_clock_anchor(anchor);
+    write_all(fd, anchor, sizeof(anchor));
+
     pthread_attr_t attr;
     pthread_attr_init(&attr);
 

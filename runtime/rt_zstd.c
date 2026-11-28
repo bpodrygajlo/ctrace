@@ -150,6 +150,13 @@ void ctrace_init(const char *target_uri) {
         }
     }
     pthread_mutex_unlock(&g_zstd_file_mutex);
+
+    // First record of the stream: the wall-clock anchor for decoders
+    void *slot = ctrace_bin_reserve(CTRACE_CLOCK_ANCHOR_SIZE);
+    if (slot) {
+        ctrace_fill_clock_anchor((uint8_t *)slot);
+        ctrace_bin_commit(slot, CTRACE_CLOCK_ANCHOR_SIZE);
+    }
 }
 
 void ctrace_flush(void) {

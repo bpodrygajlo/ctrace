@@ -36,6 +36,12 @@ static inline uint64_t ctrace_now_cycles(void) {
 
 uint64_t ctrace_now_ns(void);
 uint64_t ctrace_get_tsc_freq(void);
+
+// Clock anchor record written once per binary trace (event id 0): pairs a trace timestamp
+// with CLOCK_REALTIME so decoders can print wall-clock dates.
+// Layout: uint16_t id = 0, uint64_t trace_ns, uint64_t wall_ns (little-endian).
+#define CTRACE_CLOCK_ANCHOR_SIZE 18
+void ctrace_fill_clock_anchor(uint8_t *buf);
 uint64_t ctrace_cycles_to_ns(uint64_t cycles);
 void ctrace_calibrate_tsc(void);
 

@@ -12,6 +12,8 @@ import os
 import subprocess
 import tempfile
 import struct
+import sqlite3
+import re
 
 def main():
     if len(sys.argv) < 3:
@@ -65,9 +67,40 @@ def main():
         rec = lambda ts, fd: struct.pack("<HQ", 2, ts) + struct.pack("<i", fd) + struct.pack("<Q", 64) + struct.pack("<I", 0)
         with open(unordered_bin, "wb") as f:
             f.write(rec(3000, 3) + rec(1000, 1) + rec(2000, 2))
-        res = subprocess.run([decoder_bin, schema_path, unordered_bin], capture_output=True, text=True, timeout=5)
+        res = subprocess.run([decoder_bin, schema_path, unordered_bin, "--ns"], capture_output=True, text=True, timeout=5)
         assert res.returncode == 0, res.stderr
         assert [l.split("]")[0] for l in res.stdout.splitlines()] == ["[1000", "[2000", "[3000"], res.stdout
+
+        # Without a clock anchor timestamps are printed as seconds; with one, as local dates
+        res = subprocess.run([decoder_bin, schema_path, unordered_bin], capture_output=True, text=True, timeout=5)
+        assert res.stdout.startswith("[0.000001000] "), res.stdout
+        anchor = struct.pack("<HQQ", 0, 5000, 1_700_000_000_123_456_789)  # trace_ns=5000 <-> 2023-11-14T22:13:20.123456789Z
+        anchored_bin = os.path.join(tmpdir, "anchored.bin")
+        with open(anchored_bin, "wb") as f:
+            f.write(anchor + rec(6000, 1))  # event 1000 ns after the anchor
+        res = subprocess.run([decoder_bin, schema_path, anchored_bin], capture_output=True, text=True, timeout=5)
+        assert res.returncode == 0, res.stderr
+        assert re.match(r"^\[20\d\d-\d\d-\d\d \d\d:\d\d:\d\d\.123457789\] net_rx ", res.stdout), res.stdout
+
+        # An anchor alone is a valid, empty trace
+        anchor_only = os.path.join(tmpdir, "anchor_only.bin")
+        with open(anchor_only, "wb") as f:
+            f.write(anchor)
+        res = subprocess.run([decoder_bin, schema_path, anchor_only], capture_output=True, text=True, timeout=5)
+        assert res.returncode == 0 and res.stdout == "", (res.returncode, res.stdout)
+
+        # SQLite output: one table per event, scalars as numbers, bytes as BLOB, -q silences text
+        db_path = os.path.join(tmpdir, "out.db")
+        valid_bin = os.path.join(tmpdir, "valid.bin")
+        with open(valid_bin, "wb") as f:
+            f.write(anchor + valid_rec)
+        res = subprocess.run([decoder_bin, schema_path, valid_bin, "--sqlite", db_path, "-q"], capture_output=True, text=True, timeout=5)
+        assert res.returncode == 0 and res.stdout == "", (res.returncode, res.stdout, res.stderr)
+        db = sqlite3.connect(db_path)
+        row = db.execute("SELECT ts_ns, ts, arg_0, len, payload FROM ctrace_net_rx;").fetchone()
+        db.close()
+        assert row[0] == 1000000 and row[2] == 42 and row[3] == 64 and row[4] == payload, row
+        assert re.match(r"^20\d\d-\d\d-\d\d \d\d:\d\d:\d\d\.\d{9}$", row[1]), row
 
         # 7. Test corrupt / malformed .zst file
         corrupt_zst = os.path.join(tmpdir, "corrupt.zst")
