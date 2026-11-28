@@ -275,6 +275,7 @@ TRACE_EVENT(dl_tti, req);
 * Anonymous unions, several unions per struct (each with its own tag) and unions reached through a struct pointer are supported.
 * A tag value without a binding, or a union without any binding (e.g. `pthread_mutex_t`), is captured as the raw `sizeof(union)` bytes and shown as hex.
 * On the wire (`bin`, `ctf`, `sqlite` BLOB) a union is `uint32_t len` followed by the serialized active member; decoders select the member from the tag field.
+* Fields that carry no information, such as a `pthread_mutex_t` inside a vendor struct, are dropped with `CTRACE_BIND_SKIP(type, field)` (or `CTRACE_SKIP` on the field itself in your own headers).
 
 ---
 
@@ -289,6 +290,7 @@ TRACE_EVENT(dl_tti, req);
 | `CTRACE_COUNTED_BY(field)` | Struct attribute binding a dynamic pointer (`T*`) or FAM (`T[]`) to an integer counter field. Supports arbitrary multi-layer nesting. |
 | `CTRACE_BIND_COUNT(type, array, count)` | Out-of-line equivalent of `CTRACE_COUNTED_BY` for structs whose header cannot be edited; also binds fixed arrays (`T[N]`). |
 | `CTRACE_BIND_UNION(type, tag, value, member)` | Declares that `member` of the union inside `type` is active when the sibling field `tag` equals `value`. |
+| `CTRACE_SKIP` / `CTRACE_BIND_SKIP(type, field)` | Leaves a struct field out of every trace (locks, caches, opaque handles), in the header or out of line. |
 | `void ctrace_init(const char *target_uri)` | Initializes the runtime (`NULL` for default, directory for CTF, file for binary, `":memory:"` for SQLite). |
 | `void ctrace_flush(void)` | Flushes pending events in ring buffers, chunks, or transactions to disk. |
 | `void ctrace_shutdown(void)` | Flushes and terminates writer threads, closes file handles or databases. |
@@ -327,7 +329,8 @@ TRACE_EVENT(dl_tti, req);
 | **`const char *`** | `"%s"` (null-safe) | `uint32_t len` + bytes | `TEXT` (`bind_text`) | CTF `string` (null-term) |
 | **`ctrace_bytes_t`** | Hex preview | `uint32_t len` + bytes | `BLOB` (`bind_blob`) | `uint32_t len` + dynamic array |
 | **`struct`** | Flattened `field_sub=val` | Recursive serialization (skips pointers) | Flattened columns (`field_sub`) | Flattened struct fields |
-| **`T[N]` (N > 4, or passed directly)** | Hex preview | Raw `memcpy` of the array | `BLOB` | `uint8_t name[N]` |
+| **`T[N]` scalars (N > 4, or passed directly)** | Hex preview | Raw `memcpy` of the array | `BLOB` | `uint8_t name[N]` |
+| **`struct T[N]` (N > 4)** | `name=[{...}, ...]` | `uint32_t len` + N packed elements (no padding) | `BLOB` | `uint32_t len` + dynamic array |
 | **`union` (bound)** | `u={member={...}}` | `uint32_t len` + active member | `BLOB` (active member) | `uint32_t len` + dynamic array |
 | **`union` (unbound)** | Hex preview | `uint32_t len` + raw bytes | `BLOB` (raw bytes) | `uint32_t len` + dynamic array |
 

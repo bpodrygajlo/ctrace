@@ -164,6 +164,15 @@ std::string getCountExpr(const std::string &accessor, const std::string &countFi
     return countField;
 }
 
+// Element count of a counted array: the bound counter field, or the constant length of a
+// fixed-size array of structs (which is serialized element by element to drop padding).
+std::string countedArrayCountExpr(const std::string &accessor, const std::string &countedBy, uint64_t arrayLen) {
+    if (countedBy.empty()) {
+        return std::to_string(arrayLen) + "U";
+    }
+    return getCountExpr(accessor, countedBy);
+}
+
 void flattenFieldInternal(const Field &f, const std::string &prefix, const std::string &accessor, std::vector<FlatField> &out) {
     if (f.type_kind == "struct") {
         for (const auto &sub : f.struct_fields) {
@@ -280,6 +289,7 @@ json schemaFieldToJson(const Field &f) {
         j["first_member_name"] = f.first_member_name;
     }
     if (!f.counted_by.empty()) j["counted_by"] = f.counted_by;
+    if (f.array_len > 0) j["array_len"] = f.array_len;
     if (f.array_index >= 0) {
         j["array_index"] = f.array_index;
         j["array_parent"] = f.array_parent;
@@ -308,7 +318,6 @@ json schemaFieldToJson(const Field &f) {
         }
         j["fields"] = subs;
     } else if (f.type_kind == "fixed_array") {
-        j["array_len"] = f.array_len;
         json subs = json::array();
         for (const auto &sub : f.struct_fields) {
             subs.push_back(schemaFieldToJson(sub));
@@ -554,7 +563,7 @@ void emitFlatListSizeCalc(std::ostringstream &h, const std::vector<FlatField> &f
 
 // Recursive size calculation for counted_array (supports nested structs & nested counted_arrays)
 void emitCountedArraySizeCalc(std::ostringstream &h, const FlatField &ff, const std::string &lenVar, int depth, bool isCtf, const std::string &eol) {
-    std::string cntExpr = getCountExpr(ff.accessor_expr, ff.counted_by);
+    std::string cntExpr = countedArrayCountExpr(ff.accessor_expr, ff.counted_by, ff.array_len);
     std::string cntVar = "_cnt_" + ff.flat_name + "_" + std::to_string(depth);
     if (ff.is_pointer) {
         h << "    size_t " << cntVar << " = (((int64_t)(" << cntExpr << ") > 0) && ((const void *)(" << ff.accessor_expr << ") != NULL)) ? (size_t)(" << cntExpr << ") : 0;" << eol;
@@ -1005,7 +1014,7 @@ int main(int argc, char **argv) {
         std::string prefix = isTopLevel ? " " : "";
         std::string namePrefix = inArray ? "" : (prefix + f.name + "=");
         if (f.type_kind == "counted_array") {
-            std::string cnt = getCountExpr(accessor, f.counted_by);
+            std::string cnt = countedArrayCountExpr(accessor, f.counted_by, f.array_len);
             std::string lvar = "_i" + std::to_string(loopDepth);
             std::string cvar = "_cnt" + std::to_string(loopDepth);
             h << "    {" << eol;
@@ -1381,7 +1390,7 @@ int main(int argc, char **argv) {
                     h << "        }" << eol;
                     h << "        }" << eol;
                 } else {
-                    std::string cnt = getCountExpr(ff.accessor_expr, ff.counted_by);
+                    std::string cnt = countedArrayCountExpr(ff.accessor_expr, ff.counted_by, ff.array_len);
                     uint64_t esz = ff.elem_size > 0 ? ff.elem_size : 1;
                     if (ff.is_pointer) {
                         h << "        sqlite3_bind_blob(_st, " << col++ << ", (const void *)(" << ff.accessor_expr << "), (((int64_t)(" << cnt << ") > 0) && ((const void *)(" << ff.accessor_expr << ") != NULL)) ? (int)((size_t)(" << cnt << ") * " << esz << ") : 0, SQLITE_TRANSIENT);" << eol;

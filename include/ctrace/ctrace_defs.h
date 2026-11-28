@@ -61,6 +61,22 @@ static inline ctrace_bytes_t ctrace_make_bytes(const void *p, size_t l) {
 
 #define CTRACE_BIND_UNION(type, tag_field, tag_val, member_name) \
     _CTRACE_BIND_UNION_HELPER(type, tag_field, tag_val, member_name, __COUNTER__)
+
+// Leave a struct field out of every trace (locks, caches, opaque handles).
+// In-header form:  pthread_mutex_t lock CTRACE_SKIP;
+// Out-of-line form: CTRACE_BIND_SKIP(nfapi_ul_config_t, mutex_ul_config);
+#define CTRACE_SKIP __attribute__((annotate("ctrace:skip")))
+
+#define _CTRACE_BIND_SKIP_IMPL(type, field, uid) \
+    static const type *_CTRACE_GLUE(__ctrace_bind_skip_, uid) \
+    __attribute__((annotate("ctrace:bind_skip:" #type ":" #field))) \
+    __attribute__((unused)) = 0
+
+#define _CTRACE_BIND_SKIP_HELPER(type, field, ctr) \
+    _CTRACE_BIND_SKIP_IMPL(type, field, ctr)
+
+#define CTRACE_BIND_SKIP(type, field) \
+    _CTRACE_BIND_SKIP_HELPER(type, field, __COUNTER__)
 #else
 #define CTRACE_COUNTED_BY(field)
 
@@ -75,6 +91,14 @@ static inline ctrace_bytes_t ctrace_make_bytes(const void *p, size_t l) {
 #define _CTRACE_BIND_UNION_DEF_HELPER(ctr) _CTRACE_BIND_UNION_DEF_IMPL(ctr)
 #define CTRACE_BIND_UNION(type, tag_field, tag_val, member_name) \
     _CTRACE_BIND_UNION_DEF_HELPER(__COUNTER__)
+
+#define CTRACE_SKIP
+
+#define _CTRACE_BIND_SKIP_DEF_IMPL(uid) \
+    typedef int _CTRACE_GLUE(__ctrace_bind_skip_, uid) __attribute__((unused))
+#define _CTRACE_BIND_SKIP_DEF_HELPER(ctr) _CTRACE_BIND_SKIP_DEF_IMPL(ctr)
+#define CTRACE_BIND_SKIP(type, field) \
+    _CTRACE_BIND_SKIP_DEF_HELPER(__COUNTER__)
 #endif
 
 #ifdef __cplusplus

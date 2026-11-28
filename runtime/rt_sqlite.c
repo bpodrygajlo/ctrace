@@ -51,7 +51,7 @@ static void close_sqlite_db_locked(void) {
     }
     if (g_sqlite_cleanup_fn) {
         g_sqlite_cleanup_fn();
-    } else if (__ctrace_sqlite_finalize_events) {
+    } else {
         __ctrace_sqlite_finalize_events();
     }
     sqlite3_close_v2(g_db);
@@ -135,7 +135,7 @@ void ctrace_init(const char *target_uri)
     // Initialize tables and prepared statements
     if (g_sqlite_init_fn) {
         g_sqlite_init_fn(g_db);
-    } else if (__ctrace_sqlite_init_events) {
+    } else {
         __ctrace_sqlite_init_events(g_db);
     }
 

@@ -45,8 +45,9 @@ static inline T read_unaligned(const uint8_t *p) {
 
 class FastOutput {
 public:
-    FastOutput(int fd = STDOUT_FILENO, size_t cap = 262144)
-        : fd_(fd), cap_(cap), pos_(0) {
+    // Writes to 'fd', or appends to '*sink' when one is given (used to reorder events)
+    FastOutput(int fd = STDOUT_FILENO, std::string *sink = nullptr, size_t cap = 262144)
+        : fd_(fd), sink_(sink), cap_(cap), pos_(0) {
         buf_ = new char[cap_];
     }
     ~FastOutput() {
@@ -58,6 +59,11 @@ public:
 
     void flush() {
         if (pos_ > 0) {
+            if (sink_) {
+                sink_->append(buf_, pos_);
+                pos_ = 0;
+                return;
+            }
             size_t total = 0;
             while (total < pos_) {
                 ssize_t w = ::write(fd_, buf_ + total, pos_ - total);
@@ -74,6 +80,10 @@ public:
     void write_str(const char *s, size_t len) {
         if (len > cap_ - pos_) {
             flush();
+            if (len > cap_ && sink_) {
+                sink_->append(s, len);
+                return;
+            }
             if (len > cap_) {
                 size_t total = 0;
                 while (total < len) {
@@ -150,8 +160,11 @@ public:
             write_char(hexChars[data[i] & 0xF]);
         }
     }
+    // Bytes handed to the sink so far (the sink owns everything flushed to it)
+    size_t sink_size() const { return sink_ ? sink_->size() + pos_ : 0; }
 private:
     int fd_;
+    std::string *sink_;
     size_t cap_;
     size_t pos_;
     char *buf_;
@@ -396,11 +409,13 @@ static bool decodeFieldValue(const uint8_t *stream, size_t &offset, size_t total
             else return false;
             offset += sz;
             auto it = fld.enum_map.find(val);
+            if (inside_dict) out.write_char('\'');
             if (it != fld.enum_map.end()) {
                 out.write_str(it->second);
             } else {
                 out.write_i64(val);
             }
+            if (inside_dict) out.write_char('\'');
             if (out_tags) out_tags->push_back({fld.name, val});
             return true;
         }
@@ -778,7 +793,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    FastOutput fast_out(out_fd);
+    // Ring buffers are drained per thread, so the file is not globally time ordered.
+    // Every event line is decoded into memory first and written out sorted by timestamp.
+    std::string lines;
+    struct LineRef {
+        uint64_t ts;
+        size_t off;
+        size_t len;
+    };
+    std::vector<LineRef> refs;
+    FastOutput fast_out(-1, &lines);
 
     size_t offset = 0;
     std::vector<std::pair<std::string, int64_t>> current_tags;
@@ -798,6 +822,7 @@ int main(int argc, char **argv) {
         const EventDesc &dec = it->second;
         offset += 10;
 
+        size_t line_start = fast_out.sink_size();
         fast_out.write_char('[');
         fast_out.write_u64(ts_ns);
         fast_out.write_str("] ");
@@ -816,6 +841,7 @@ int main(int argc, char **argv) {
             }
         }
         fast_out.write_char('\n');
+        refs.push_back({ts_ns, line_start, fast_out.sink_size() - line_start});
 
         if (truncated) {
             std::cerr << "ctrace-decode error: Truncated event '" << dec.name << "' at offset " << offset << "\n";
@@ -830,6 +856,12 @@ int main(int argc, char **argv) {
     }
 
     fast_out.flush();
+    std::stable_sort(refs.begin(), refs.end(), [](const LineRef &a, const LineRef &b) { return a.ts < b.ts; });
+    FastOutput file_out(out_fd);
+    for (const auto &r : refs) {
+        file_out.write_str(lines.data() + r.off, r.len);
+    }
+    file_out.flush();
 
     if (out_fd != STDOUT_FILENO) {
         close(out_fd);

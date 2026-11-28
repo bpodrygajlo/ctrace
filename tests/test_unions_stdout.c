@@ -45,6 +45,14 @@ typedef union { uint32_t word; uint8_t bytes[4]; } word_t;
 /* Unbound union member */
 typedef struct { int n; pthread_mutex_t m; } with_mutex_t;
 
+/* Fixed array of padded structs, and a field skipped in the header */
+typedef enum { RC_OK = 0, RC_BAD = 1 } rc_t;
+typedef struct { uint8_t a; rc_t rc; uint32_t b; } cell_t;
+typedef struct {
+    int secret CTRACE_SKIP;
+    cell_t cells[6];
+} cells_t;
+
 /* Anonymous struct member */
 typedef struct {
     int id;
@@ -122,6 +130,15 @@ int main(void) {
     as.y = 9;
     TRACE_EVENT(anon_struct_event, as);
 
+    cells_t cells;
+    memset(&cells, 0, sizeof(cells));
+    cells.secret = 123;
+    cells.cells[1].a = 7;
+    cells.cells[1].rc = RC_BAD;
+    cells.cells[1].b = 500;
+    cells.cells[5].a = 9;
+    TRACE_EVENT(cells_event, cells);
+
     ctrace_flush();
     ctrace_shutdown();
 
@@ -137,6 +154,9 @@ int main(void) {
     assert(log_has(log, "hex=00000000000000000000000000000000"));
     assert(log_has(log, "samples_event samples=[len=12,hex=010002000300040005000600]"));
     assert(log_has(log, "anon_struct_event as={id=12, x=7, y=9}"));
+    assert(log_has(log, "cells_event cells={cells=[{a=0, rc=RC_OK, b=0}, {a=7, rc=RC_BAD, b=500}, {a=0, rc=RC_OK, b=0}, "
+                        "{a=0, rc=RC_OK, b=0}, {a=0, rc=RC_OK, b=0}, {a=9, rc=RC_OK, b=0}]}"));
+    assert(!log_has(log, "secret"));
 
     printf("test_unions_stdout passed successfully!\n");
     return 0;

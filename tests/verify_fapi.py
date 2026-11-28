@@ -80,6 +80,16 @@ def main():
     anon_ev = next(e for e in schema["events"] if e["name"] == "fapi_anon_struct_event")
     assert [f["name"] for f in anon_ev["fields"][0]["fields"]] == ["id", "x", "y"], anon_ev
 
+    # A fixed array of structs is a constant-count counted array (elements are packed, not memcpy'd)
+    cells_ev = next(e for e in schema["events"] if e["name"] == "fapi_cells_event")
+    cells_fld = next(f for f in cells_ev["fields"][0]["fields"] if f["name"] == "cells")
+    assert cells_fld["type"] == "counted_array" and cells_fld["array_len"] == 8 and "counted_by" not in cells_fld, cells_fld
+    assert cells_fld["fields"][0]["type"] == "struct"
+
+    # Skipped field is absent from the schema
+    skip_ev = next(e for e in schema["events"] if e["name"] == "fapi_skip_event")
+    assert [f["name"] for f in skip_ev["fields"][0]["fields"]] == ["n", "z"], skip_ev
+
     # 2. Decode binary stream
     if decode_tool.endswith(".py"):
         cmd = [sys.executable, decode_tool, schema_path, bin_path]
@@ -171,6 +181,20 @@ def main():
     # Anonymous struct members
     anon_line = event_lines("fapi_anon_struct_event")[0]
     assert "as_id=12 as_x=7 as_y=9" in anon_line, anon_line
+
+    # Padded struct elements: 8 elements, each read from its own offset, enum names quoted inside dicts
+    cells_line = event_lines("fapi_cells_event")[0]
+    assert "cells_cells=[{'a': 1, 'rc': 'FAPI_RC_OK', 'b': 10}, {'a': 7, 'rc': 'FAPI_RC_BAD', 'b': 16909060}, " in cells_line, cells_line
+    assert cells_line.count("{'a': 0, 'rc': 'FAPI_RC_OK', 'b': 0}") == 5, cells_line
+    assert cells_line.rstrip().endswith("{'a': 77, 'rc': 'FAPI_RC_BAD', 'b': 7777}]"), cells_line
+
+    # Skipped field never reaches the trace
+    skip_line = event_lines("fapi_skip_event")[0]
+    assert skip_line.rstrip().endswith("fapi_skip_event sk_n=1 sk_z=2"), skip_line
+
+    # Output is ordered by timestamp
+    stamps = [int(l.split("]")[0][1:]) for l in lines if l.startswith("[")]
+    assert stamps == sorted(stamps), "decoder output is not sorted by timestamp"
 
     print("All FAPI union, fixed-array, and dynamic count binding assertions PASSED!")
 

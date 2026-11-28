@@ -46,6 +46,7 @@ struct FieldInfo {
     int array_index = -1;
     std::string array_parent;
     std::string counted_by;
+    uint64_t array_len = 0; // fixed_array, or counted_array with a constant element count
 
     // For union cases: the discriminator value selecting this member
     int64_t tag_val = 0;
@@ -86,6 +87,8 @@ std::map<std::pair<std::string, std::string>, std::string> g_bound_counts;
 std::map<std::string, std::vector<UnionCaseBinding>> g_bound_unions;
 std::map<const RecordDecl *, std::vector<UnionCaseBinding>> g_bound_unions_by_rd;
 std::map<std::pair<const RecordDecl *, std::string>, std::string> g_bound_counts_by_rd;
+std::set<std::pair<std::string, std::string>> g_skipped_fields;
+std::set<std::pair<const RecordDecl *, std::string>> g_skipped_fields_by_rd;
 
 std::string stripStructPrefix(const std::string &s) {
     if (s.rfind("struct ", 0) == 0) return s.substr(7);
@@ -102,6 +105,14 @@ std::string getCountedByField(const FieldDecl *FD) {
         }
     }
     return "";
+}
+
+bool hasSkipAnnotation(const FieldDecl *FD) {
+    if (!FD) return false;
+    for (const auto *A : FD->specific_attrs<AnnotateAttr>()) {
+        if (A->getAnnotation() == "ctrace:skip") return true;
+    }
+    return false;
 }
 
 std::string getSanitizedMemberPath(const Expr *e) {
@@ -276,6 +287,14 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
             QualType ft = FD->getType();
             QualType ftCanon = ft.getCanonicalType();
 
+            // Fields excluded with CTRACE_SKIP / CTRACE_BIND_SKIP
+            if (!fieldName.empty() &&
+                (hasSkipAnnotation(FD) ||
+                 g_skipped_fields_by_rd.count({RD, fieldName}) ||
+                 (!sName.empty() && g_skipped_fields.count({sName, fieldName})))) {
+                continue;
+            }
+
             // Check if field is a union (named or anonymous)
             if (ftCanon->isUnionType()) {
                 bool isAnon = fieldName.empty();
@@ -440,16 +459,22 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
                     }
                     uint64_t arrLen = CAT->getSize().getZExtValue();
                     if (arrLen > 4) {
-                        // Fixed array (Gap 3): preserve as contiguous array rather than flattening
                         FieldInfo elem = resolveFieldType(elemType, fieldName + "_elem", Ctx, depth + 1);
                         FieldInfo af;
                         af.name = fieldName;
-                        af.type_kind = "fixed_array";
                         af.c_type = ft.getAsString();
-                        af.size = arrLen * elem.size;
-                        af.array_index = -1;
-                        af.array_parent = std::to_string(arrLen);
+                        af.array_len = arrLen;
                         af.struct_fields.push_back(elem);
+                        if (elem.type_kind == "struct") {
+                            // Struct elements carry padding, so they are serialized field by field
+                            // like a counted array whose count is the array length.
+                            af.type_kind = "counted_array";
+                            af.size = elem.size;
+                        } else {
+                            // Scalars have no padding: one contiguous memcpy of the array
+                            af.type_kind = "fixed_array";
+                            af.size = arrLen * elem.size;
+                        }
                         f.struct_fields.push_back(af);
                         continue;
                     } else {
@@ -555,7 +580,7 @@ FieldInfo resolveFieldType(QualType qualType, const std::string &name, ASTContex
             f.c_type = "const void *";
             f.is_pointer = true;
             f.size = arrLen * elem.size;
-            f.array_parent = std::to_string(arrLen);
+            f.array_len = arrLen;
             f.struct_fields.push_back(elem);
             return f;
         }
@@ -684,6 +709,28 @@ public:
                         }
                     }
                 }
+            } else if (ann.rfind("ctrace:bind_skip:", 0) == 0) {
+                // format: ctrace:bind_skip:type:field
+                std::vector<std::string> parts;
+                std::stringstream ss(ann);
+                std::string item;
+                while (std::getline(ss, item, ':')) parts.push_back(item);
+                if (parts.size() >= 4) {
+                    std::string typeName = stripStructPrefix(parts[2]);
+                    g_skipped_fields.insert({typeName, parts[3]});
+
+                    QualType qt = VD->getType();
+                    if (qt->isPointerType()) {
+                        QualType pt = qt->getPointeeType().getCanonicalType();
+                        if (const auto *RT = pt->getAs<RecordType>()) {
+                            const RecordDecl *RD = RT->getDecl()->getDefinition();
+                            if (!RD) RD = RT->getDecl();
+                            if (RD) {
+                                g_skipped_fields_by_rd.insert({RD, parts[3]});
+                            }
+                        }
+                    }
+                }
             } else if (ann.rfind("ctrace:bind_union:", 0) == 0) {
                 // format: ctrace:bind_union:type:tag_field:tag_val:member_name
                 std::vector<std::string> parts;
@@ -807,6 +854,9 @@ json fieldInfoToJson(const FieldInfo &f) {
     if (!f.counted_by.empty()) {
         j["counted_by"] = f.counted_by;
     }
+    if (f.array_len > 0) {
+        j["array_len"] = f.array_len;
+    }
     if (f.array_index >= 0) {
         j["array_index"] = f.array_index;
         j["array_parent"] = f.array_parent;
@@ -832,7 +882,6 @@ json fieldInfoToJson(const FieldInfo &f) {
         }
         j["struct_fields"] = subfields;
     } else if (f.type_kind == "fixed_array") {
-        j["array_len"] = f.array_parent.empty() ? 0ULL : (unsigned long long)std::strtoull(f.array_parent.c_str(), nullptr, 10);
         json subfields = json::array();
         for (const auto &sub : f.struct_fields) {
             subfields.push_back(fieldInfoToJson(sub));

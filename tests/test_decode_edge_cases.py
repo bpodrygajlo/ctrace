@@ -60,7 +60,16 @@ def main():
         res = subprocess.run([decoder_bin, schema_path, trunc_ca_bin], capture_output=True, timeout=5)
         assert res.returncode != 0, f"Expected non-zero exit code for truncated CountedArray, got {res.returncode}"
 
-        # 6. Test corrupt / malformed .zst file
+        # 6. Events are written out ordered by timestamp, whatever their order in the file
+        unordered_bin = os.path.join(tmpdir, "unordered.bin")
+        rec = lambda ts, fd: struct.pack("<HQ", 2, ts) + struct.pack("<i", fd) + struct.pack("<Q", 64) + struct.pack("<I", 0)
+        with open(unordered_bin, "wb") as f:
+            f.write(rec(3000, 3) + rec(1000, 1) + rec(2000, 2))
+        res = subprocess.run([decoder_bin, schema_path, unordered_bin], capture_output=True, text=True, timeout=5)
+        assert res.returncode == 0, res.stderr
+        assert [l.split("]")[0] for l in res.stdout.splitlines()] == ["[1000", "[2000", "[3000"], res.stdout
+
+        # 7. Test corrupt / malformed .zst file
         corrupt_zst = os.path.join(tmpdir, "corrupt.zst")
         with open(corrupt_zst, "wb") as f:
             f.write(struct.pack("<I", 100) + b"\xde\xad\xbe\xef\x00\x01\x02")

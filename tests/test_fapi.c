@@ -142,6 +142,22 @@ typedef struct {
 } fapi_flags_list_t;
 CTRACE_BIND_COUNT(fapi_flags_list_t, flags, n);
 
+/* Fixed array of padded structs without any binding: 12 bytes in C, 9 bytes packed */
+typedef enum { FAPI_RC_OK = 0, FAPI_RC_BAD = 1 } fapi_rc_t;
+typedef struct { uint8_t a; fapi_rc_t rc; uint32_t b; } fapi_cell_t;
+typedef struct {
+    uint16_t n;
+    fapi_cell_t cells[8];
+} fapi_cells_t;
+
+/* A field excluded from the trace out of line */
+typedef struct {
+    int n;
+    pthread_mutex_t m;
+    int z;
+} fapi_skip_t;
+CTRACE_BIND_SKIP(fapi_skip_t, m);
+
 /* C11 anonymous struct member */
 typedef struct {
     int id;
@@ -316,6 +332,22 @@ int main(void) {
     as.x = 7;
     as.y = 9;
     TRACE_EVENT(fapi_anon_struct_event, as);
+
+    // Fixed array of padded structs: every element must decode from its own offset
+    fapi_cells_t cells;
+    memset(&cells, 0, sizeof(cells));
+    cells.n = 8;
+    cells.cells[0].a = 1;  cells.cells[0].rc = FAPI_RC_OK;  cells.cells[0].b = 10;
+    cells.cells[1].a = 7;  cells.cells[1].rc = FAPI_RC_BAD; cells.cells[1].b = 0x01020304;
+    cells.cells[7].a = 77; cells.cells[7].rc = FAPI_RC_BAD; cells.cells[7].b = 7777;
+    TRACE_EVENT(fapi_cells_event, cells);
+
+    // Skipped field
+    fapi_skip_t sk;
+    memset(&sk, 0, sizeof(sk));
+    sk.n = 1;
+    sk.z = 2;
+    TRACE_EVENT(fapi_skip_event, sk);
 
     ctrace_flush();
     ctrace_shutdown();
